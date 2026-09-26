@@ -1,141 +1,149 @@
 // Copyright 2017 The oksvg Authors. All rights reserved.
 // created: 2/12/2017 by S.R.Wiley
-//
-// utils.go implements translation of an SVG2.0 path into a rasterx Path.
 
 package oksvg
 
 import (
 	"errors"
-	"log"
 	"math"
+	"strings"
 	"unicode"
 
 	"github.com/srwiley/rasterx"
-
 	"golang.org/x/image/math/fixed"
 )
 
-type (
-	// ErrorMode is the for setting how the parser reacts to unparsed elements
-	ErrorMode uint8
-	// PathCursor is used to parse SVG format path strings into a rasterx Path
-	PathCursor struct {
-		rasterx.Path
-		placeX, placeY         float64
-		cntlPtX, cntlPtY       float64
-		pathStartX, pathStartY float64
-		points                 []float64
-		lastKey                uint8
-		ErrorMode              ErrorMode
-		inPath                 bool
-	}
-)
+// pathCursor builds a rasterx path from SVG path data and basic shapes.
+type pathCursor struct {
+	rasterx.Path
+	placeX, placeY         float64
+	cntlPtX, cntlPtY       float64
+	pathStartX, pathStartY float64
+	points                 []float64
+	lastKey                uint8
+	inPath                 bool
 
-const (
-	// IgnoreErrorMode skips un-parsed SVG elements.
-	IgnoreErrorMode ErrorMode = iota
+	// scale is the number of path units per user unit. Paths are in fixed
+	// point, so scaling them up keeps them precise in small user spaces.
+	scale float64
+}
 
-	// WarnErrorMode outputs a warning when an un-parsed SVG element is found.
-	WarnErrorMode
+// fixed returns a point in user space in path units.
+func (c *pathCursor) fixed(x, y float64) fixed.Point26_6 {
+	return fixed.Point26_6{
+		X: fixed.Int26_6(math.Round(x * c.scale * 64)),
+		Y: fixed.Int26_6(math.Round(y * c.scale * 64))}
+}
 
-	// StrictErrorMode causes an error when an un-parsed SVG element is found.
-	StrictErrorMode
-)
+// addArc adds an arc from the current point to the path, as rasterx.AddArc
+// does in user space.
+func (c *pathCursor) addArc(points []float64, cx, cy float64) {
+	s := c.scale
+	p := []float64{points[0] * s, points[1] * s, points[2], points[3], points[4], points[5] * s, points[6] * s}
+	x, y := rasterx.AddArc(p, cx*s, cy*s, c.placeX*s, c.placeY*s, &c.Path)
+	c.placeX, c.placeY = x/s, y/s
+}
 
 var (
-	errParamMismatch  = errors.New("param mismatch")
-	errCommandUnknown = errors.New("unknown command")
-	errZeroLengthID   = errors.New("zero length id")
+	errArgCount       = errors.New("wrong number of arguments")
+	errCommandUnknown = errors.New("unknown path command")
 )
 
-// ReadFloat reads a floating point value and adds it to the cursor's points slice.
-func (c *PathCursor) ReadFloat(numStr string) error {
-	last := 0
-	isFirst := true
-	for i, n := range numStr {
-		if n == '.' {
-			if isFirst {
-				isFirst = false
-				continue
+// getPoints reads the numbers in s into the cursor's points, skipping
+// characters that are not part of a number. If arc is set, it reads the
+// arguments of arc commands, whose flags need no separators.
+func (c *pathCursor) getPoints(s string, arc bool) error {
+	c.points = c.points[:0]
+	for s != "" {
+		if i := len(c.points) % 7; arc && (i == 3 || i == 4) {
+			s = strings.TrimLeft(s, ", \t\n\r\f")
+			if s == "" {
+				break
 			}
-			f, err := parseFloat(numStr[last:i], 64)
-			if err != nil {
-				return err
+			if s[0] != '0' && s[0] != '1' {
+				return errArgCount
 			}
-			c.points = append(c.points, f)
-			last = i
+			c.points = append(c.points, float64(s[0]-'0'))
+			s = s[1:]
+			continue
 		}
-	}
-	f, err := parseFloat(numStr[last:], 64)
-	if err != nil {
-		return err
-	}
-	c.points = append(c.points, f)
-	return nil
-}
-
-// GetPoints reads a set of floating point values from the SVG format number string,
-// and add them to the cursor's points slice.
-func (c *PathCursor) GetPoints(dataPoints string) error {
-	lastIndex := -1
-	c.points = c.points[0:0]
-	lr := ' '
-	for i, r := range dataPoints {
-		if !unicode.IsNumber(r) && r != '.' && !(r == '-' && lr == 'e') && r != 'e' {
-			if lastIndex != -1 {
-				if err := c.ReadFloat(dataPoints[lastIndex:i]); err != nil {
-					return err
-				}
-			}
-			if r == '-' {
-				lastIndex = i
-			} else {
-				lastIndex = -1
-			}
-		} else if lastIndex == -1 {
-			lastIndex = i
+		n := numberLen(s)
+		if n == 0 {
+			s = s[1:]
+			continue
 		}
-		lr = r
-	}
-	if lastIndex != -1 && lastIndex != len(dataPoints) {
-		if err := c.ReadFloat(dataPoints[lastIndex:]); err != nil {
+		v, err := parseNumber(s[:n])
+		if err != nil {
 			return err
 		}
+		c.points = append(c.points, v)
+		s = s[n:]
 	}
 	return nil
 }
 
-// EllipseAt adds a path of an elipse centered at cx, cy of radius rx and ry
-// to the PathCursor
-func (c *PathCursor) EllipseAt(cx, cy, rx, ry float64) {
+// numberLen returns the length of the number at the start of s, or 0 if
+// there is none.
+func numberLen(s string) int {
+	i := 0
+	digits := func() int {
+		start := i
+		for i < len(s) && '0' <= s[i] && s[i] <= '9' {
+			i++
+		}
+		return i - start
+	}
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	n := digits()
+	if i < len(s) && s[i] == '.' {
+		i++
+		n += digits()
+	}
+	if n == 0 {
+		return 0
+	}
+	if end := i; i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		i++
+		if i < len(s) && (s[i] == '+' || s[i] == '-') {
+			i++
+		}
+		if digits() == 0 {
+			i = end
+		}
+	}
+	return i
+}
+
+// ellipse adds an ellipse centered at (cx, cy) with radii rx and ry.
+func (c *pathCursor) ellipse(cx, cy, rx, ry float64) {
 	c.placeX, c.placeY = cx+rx, cy
-	c.points = c.points[0:0]
-	c.points = append(c.points, rx, ry, 0.0, 1.0, 0.0, c.placeX, c.placeY)
-	c.Path.Start(fixed.Point26_6{
-		X: fixed.Int26_6(c.placeX * 64),
-		Y: fixed.Int26_6(c.placeY * 64)})
-	c.placeX, c.placeY = rasterx.AddArc(c.points, cx, cy, c.placeX, c.placeY, &c.Path)
+	c.Path.Start(c.fixed(c.placeX, c.placeY))
+	// SVG ellipses run in the positive angle direction, which dashes follow,
+	// in two halves because rasterx draws a full arc the other way.
+	for _, x := range []float64{cx - rx, cx + rx} {
+		c.addArc([]float64{rx, ry, 0, 0, 1, x, cy}, cx, cy)
+	}
 	c.Path.Stop(true)
 }
 
-// AddArcFromA adds a path of an arc element to the cursor path to the PathCursor
-func (c *PathCursor) AddArcFromA(points []float64) {
+// arcTo adds an elliptical arc from the current point, given the seven
+// arguments of an SVG arc command in absolute coordinates.
+func (c *pathCursor) arcTo(points []float64) {
 	cx, cy := rasterx.FindEllipseCenter(&points[0], &points[1], points[2]*math.Pi/180, c.placeX,
 		c.placeY, points[5], points[6], points[4] == 0, points[3] == 0)
-	c.placeX, c.placeY = rasterx.AddArc(c.points, cx, cy, c.placeX, c.placeY, &c.Path)
+	c.addArc(points, cx, cy)
 }
 
-// CompilePath translates the svgPath description string into a rasterx path.
-// All valid SVG path elements are interpreted to rasterx equivalents.
-// The resulting path element is stored in the PathCursor.
-func (c *PathCursor) CompilePath(svgPath string) error {
-	c.init()
+// compilePath sets the path to the SVG path data d, up to its first error.
+func (c *pathCursor) compilePath(d string) error {
+	c.reset()
 	lastIndex := -1
-	for i, v := range svgPath {
-		if unicode.IsLetter(v) && v != 'e' {
+	for i, v := range d {
+		if unicode.IsLetter(v) && v != 'e' && v != 'E' {
 			if lastIndex != -1 {
-				if err := c.addSeg(svgPath[lastIndex:i]); err != nil {
+				if err := c.addSeg(d[lastIndex:i]); err != nil {
 					return err
 				}
 			}
@@ -143,7 +151,7 @@ func (c *PathCursor) CompilePath(svgPath string) error {
 		}
 	}
 	if lastIndex != -1 {
-		if err := c.addSeg(svgPath[lastIndex:]); err != nil {
+		if err := c.addSeg(d[lastIndex:]); err != nil {
 			return err
 		}
 	}
@@ -154,14 +162,14 @@ func reflect(px, py, rx, ry float64) (x, y float64) {
 	return px*2 - rx, py*2 - ry
 }
 
-func (c *PathCursor) valsToAbs(last float64) {
+func (c *pathCursor) valsToAbs(last float64) {
 	for i := 0; i < len(c.points); i++ {
 		last += c.points[i]
 		c.points[i] = last
 	}
 }
 
-func (c *PathCursor) pointsToAbs(sz int) {
+func (c *pathCursor) pointsToAbs(sz int) {
 	lastX := c.placeX
 	lastY := c.placeY
 	for j := 0; j < len(c.points); j += sz {
@@ -174,7 +182,7 @@ func (c *PathCursor) pointsToAbs(sz int) {
 	}
 }
 
-func (c *PathCursor) hasSetsOrMore(sz int, rel bool) bool {
+func (c *pathCursor) hasSetsOrMore(sz int, rel bool) bool {
 	if !(len(c.points) >= sz && len(c.points)%sz == 0) {
 		return false
 	}
@@ -184,7 +192,7 @@ func (c *PathCursor) hasSetsOrMore(sz int, rel bool) bool {
 	return true
 }
 
-func (c *PathCursor) reflectControlQuad() {
+func (c *pathCursor) reflectControlQuad() {
 	switch c.lastKey {
 	case 'q', 'Q', 'T', 't':
 		c.cntlPtX, c.cntlPtY = reflect(c.placeX, c.placeY, c.cntlPtX, c.cntlPtY)
@@ -193,7 +201,7 @@ func (c *PathCursor) reflectControlQuad() {
 	}
 }
 
-func (c *PathCursor) reflectControlCube() {
+func (c *pathCursor) reflectControlCube() {
 	switch c.lastKey {
 	case 'c', 'C', 's', 'S':
 		c.cntlPtX, c.cntlPtY = reflect(c.placeX, c.placeY, c.cntlPtX, c.cntlPtY)
@@ -202,22 +210,18 @@ func (c *PathCursor) reflectControlCube() {
 	}
 }
 
-// addSeg decodes an SVG seqment string into equivalent raster path commands saved
-// in the cursor's Path
-func (c *PathCursor) addSeg(segString string) error {
-	// Parse the string describing the numeric points in SVG format
-	if err := c.GetPoints(segString[1:]); err != nil {
+// addSeg adds a segment of path data: a command and its arguments.
+func (c *pathCursor) addSeg(seg string) error {
+	k := seg[0]
+	if err := c.getPoints(seg[1:], k == 'a' || k == 'A'); err != nil {
 		return err
 	}
 	l := len(c.points)
-	k := segString[0]
 	rel := false
 	switch k {
-	case 'z':
-		fallthrough
-	case 'Z':
+	case 'z', 'Z':
 		if len(c.points) != 0 {
-			return errParamMismatch
+			return errArgCount
 		}
 		if c.inPath {
 			c.Path.Stop(true)
@@ -230,15 +234,13 @@ func (c *PathCursor) addSeg(segString string) error {
 		fallthrough
 	case 'M':
 		if !c.hasSetsOrMore(2, rel) {
-			return errParamMismatch
+			return errArgCount
 		}
 		c.pathStartX, c.pathStartY = c.points[0], c.points[1]
 		c.inPath = true
-		c.Path.Start(fixed.Point26_6{X: fixed.Int26_6((c.pathStartX) * 64), Y: fixed.Int26_6((c.pathStartY) * 64)})
+		c.Path.Start(c.fixed(c.pathStartX, c.pathStartY))
 		for i := 2; i < l-1; i += 2 {
-			c.Path.Line(fixed.Point26_6{
-				X: fixed.Int26_6((c.points[i]) * 64),
-				Y: fixed.Int26_6((c.points[i+1]) * 64)})
+			c.Path.Line(c.fixed(c.points[i], c.points[i+1]))
 		}
 		c.placeX = c.points[l-2]
 		c.placeY = c.points[l-1]
@@ -247,12 +249,10 @@ func (c *PathCursor) addSeg(segString string) error {
 		fallthrough
 	case 'L':
 		if !c.hasSetsOrMore(2, rel) {
-			return errParamMismatch
+			return errArgCount
 		}
 		for i := 0; i < l-1; i += 2 {
-			c.Path.Line(fixed.Point26_6{
-				X: fixed.Int26_6((c.points[i]) * 64),
-				Y: fixed.Int26_6((c.points[i+1]) * 64)})
+			c.Path.Line(c.fixed(c.points[i], c.points[i+1]))
 		}
 		c.placeX = c.points[l-2]
 		c.placeY = c.points[l-1]
@@ -261,12 +261,10 @@ func (c *PathCursor) addSeg(segString string) error {
 		fallthrough
 	case 'V':
 		if !c.hasSetsOrMore(1, false) {
-			return errParamMismatch
+			return errArgCount
 		}
 		for _, p := range c.points {
-			c.Path.Line(fixed.Point26_6{
-				X: fixed.Int26_6((c.placeX) * 64),
-				Y: fixed.Int26_6((p) * 64)})
+			c.Path.Line(c.fixed(c.placeX, p))
 		}
 		c.placeY = c.points[l-1]
 	case 'h':
@@ -274,12 +272,10 @@ func (c *PathCursor) addSeg(segString string) error {
 		fallthrough
 	case 'H':
 		if !c.hasSetsOrMore(1, false) {
-			return errParamMismatch
+			return errArgCount
 		}
 		for _, p := range c.points {
-			c.Path.Line(fixed.Point26_6{
-				X: fixed.Int26_6((p) * 64),
-				Y: fixed.Int26_6((c.placeY) * 64)})
+			c.Path.Line(c.fixed(p, c.placeY))
 		}
 		c.placeX = c.points[l-1]
 	case 'q':
@@ -287,16 +283,12 @@ func (c *PathCursor) addSeg(segString string) error {
 		fallthrough
 	case 'Q':
 		if !c.hasSetsOrMore(4, rel) {
-			return errParamMismatch
+			return errArgCount
 		}
 		for i := 0; i < l-3; i += 4 {
 			c.Path.QuadBezier(
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.points[i]) * 64),
-					Y: fixed.Int26_6((c.points[i+1]) * 64)},
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.points[i+2]) * 64),
-					Y: fixed.Int26_6((c.points[i+3]) * 64)})
+				c.fixed(c.points[i], c.points[i+1]),
+				c.fixed(c.points[i+2], c.points[i+3]))
 		}
 		c.cntlPtX, c.cntlPtY = c.points[l-4], c.points[l-3]
 		c.placeX = c.points[l-2]
@@ -306,17 +298,13 @@ func (c *PathCursor) addSeg(segString string) error {
 		fallthrough
 	case 'T':
 		if !c.hasSetsOrMore(2, rel) {
-			return errParamMismatch
+			return errArgCount
 		}
 		for i := 0; i < l-1; i += 2 {
 			c.reflectControlQuad()
 			c.Path.QuadBezier(
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.cntlPtX) * 64),
-					Y: fixed.Int26_6((c.cntlPtY) * 64)},
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.points[i]) * 64),
-					Y: fixed.Int26_6((c.points[i+1]) * 64)})
+				c.fixed(c.cntlPtX, c.cntlPtY),
+				c.fixed(c.points[i], c.points[i+1]))
 			c.lastKey = k
 			c.placeX = c.points[i]
 			c.placeY = c.points[i+1]
@@ -326,19 +314,13 @@ func (c *PathCursor) addSeg(segString string) error {
 		fallthrough
 	case 'C':
 		if !c.hasSetsOrMore(6, rel) {
-			return errParamMismatch
+			return errArgCount
 		}
 		for i := 0; i < l-5; i += 6 {
 			c.Path.CubeBezier(
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.points[i]) * 64),
-					Y: fixed.Int26_6((c.points[i+1]) * 64)},
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.points[i+2]) * 64),
-					Y: fixed.Int26_6((c.points[i+3]) * 64)},
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.points[i+4]) * 64),
-					Y: fixed.Int26_6((c.points[i+5]) * 64)})
+				c.fixed(c.points[i], c.points[i+1]),
+				c.fixed(c.points[i+2], c.points[i+3]),
+				c.fixed(c.points[i+4], c.points[i+5]))
 		}
 		c.cntlPtX, c.cntlPtY = c.points[l-4], c.points[l-3]
 		c.placeX = c.points[l-2]
@@ -348,16 +330,13 @@ func (c *PathCursor) addSeg(segString string) error {
 		fallthrough
 	case 'S':
 		if !c.hasSetsOrMore(4, rel) {
-			return errParamMismatch
+			return errArgCount
 		}
 		for i := 0; i < l-3; i += 4 {
 			c.reflectControlCube()
-			c.Path.CubeBezier(fixed.Point26_6{
-				X: fixed.Int26_6((c.cntlPtX) * 64), Y: fixed.Int26_6((c.cntlPtY) * 64)},
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.points[i]) * 64), Y: fixed.Int26_6((c.points[i+1]) * 64)},
-				fixed.Point26_6{
-					X: fixed.Int26_6((c.points[i+2]) * 64), Y: fixed.Int26_6((c.points[i+3]) * 64)})
+			c.Path.CubeBezier(c.fixed(c.cntlPtX, c.cntlPtY),
+				c.fixed(c.points[i], c.points[i+1]),
+				c.fixed(c.points[i+2], c.points[i+3]))
 			c.lastKey = k
 			c.cntlPtX, c.cntlPtY = c.points[i], c.points[i+1]
 			c.placeX = c.points[i+2]
@@ -365,32 +344,34 @@ func (c *PathCursor) addSeg(segString string) error {
 		}
 	case 'a', 'A':
 		if !c.hasSetsOrMore(7, false) {
-			return errParamMismatch
+			return errArgCount
 		}
 		for i := 0; i < l-6; i += 7 {
 			if k == 'a' {
 				c.points[i+5] += c.placeX
 				c.points[i+6] += c.placeY
 			}
-			c.AddArcFromA(c.points[i:])
+			if c.points[i] == 0 || c.points[i+1] == 0 {
+				// An arc with a zero radius is a line.
+				c.placeX, c.placeY = c.points[i+5], c.points[i+6]
+				c.Path.Line(c.fixed(c.placeX, c.placeY))
+				continue
+			}
+			c.points[i], c.points[i+1] = math.Abs(c.points[i]), math.Abs(c.points[i+1])
+			c.arcTo(c.points[i:])
 		}
 	default:
-		if c.ErrorMode == StrictErrorMode {
-			return errCommandUnknown
-		}
-		if c.ErrorMode == WarnErrorMode {
-			log.Println("Ignoring svg command " + string(k))
-		}
+		return errCommandUnknown
 	}
-	// So we know how to extend some segment types
 	c.lastKey = k
 	return nil
 }
 
-func (c *PathCursor) init() {
-	c.placeX = 0.0
-	c.placeY = 0.0
-	c.points = c.points[0:0]
+// reset clears the path and the current point.
+func (c *pathCursor) reset() {
+	c.placeX = 0
+	c.placeY = 0
+	c.points = c.points[:0]
 	c.lastKey = ' '
 	c.Path.Clear()
 	c.inPath = false

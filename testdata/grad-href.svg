@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 40 40">
+  <defs>
+    <linearGradient id="stops"><stop stop-color="#e22"/><stop offset=".5" stop-color="#fd4"/><stop offset="1" stop-color="#22e"/></linearGradient>
+    <linearGradient id="down" xlink:href="#stops" x2="0" y2="18" gradientUnits="userSpaceOnUse"/>
+    <linearGradient id="a" xlink:href="#down"/>
+    <radialGradient id="r" xlink:href="#stops" cx="0" cy="0" r=".6" fx=".3" spreadMethod="reflect" gradientTransform="translate(.5 .5)"/>
+    <radialGradient id="b" xlink:href="#r"/>
+    <radialGradient id="c" xlink:href="#b" cx=".2" cy="-.2"/>
+    <linearGradient id="d" xlink:href="#a" x1="22" x2="38" y2="0"/>
+  </defs>
+  <rect x="2" y="2" width="16" height="16" fill="url(#a)"/>
+  <rect x="22" y="2" width="16" height="16" fill="url(#b)"/>
+  <rect x="2" y="22" width="16" height="16" fill="url(#c)"/>
+  <rect x="22" y="22" width="16" height="16" fill="url(#d)"/>
+</svg>

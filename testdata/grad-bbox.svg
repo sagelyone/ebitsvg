@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 40">
+  <defs>
+    <linearGradient id="a" x2="1" y2="1"><stop stop-color="#f0f"/><stop offset="1" stop-color="#0ff"/></linearGradient>
+    <linearGradient id="b" gradientTransform="rotate(90 .5 .5)"><stop stop-color="#000"/><stop offset="1" stop-color="#fc0"/></linearGradient>
+    <radialGradient id="c" fx=".3" fy=".3" spreadMethod="reflect" r=".3"><stop stop-color="#fff"/><stop offset="1" stop-color="#06c"/></radialGradient>
+  </defs>
+  <rect x="3" y="3" width="16" height="10" fill="url(#a)" transform="rotate(20 11 8)"/>
+  <ellipse cx="30" cy="10" rx="8" ry="6" fill="url(#b)"/>
+  <circle cx="12" cy="29" r="9" fill="url(#c)"/>
+  <path d="M24 22h12v14h-12z" fill="none" stroke="url(#a)" stroke-width="3"/>
+</svg>

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 40 20">
+  <rect width="40" height="20" fill="rgb(100%, 95%, 80%)"/>
+  <rect x="1" y="1" width="8" height="8" fill="rgba(200, 0, 0, 0.5)"/>
+  <rect x="11" y="1" width="8" height="8" fill="hsl(120, 60%, 40%)"/>
+  <rect x="21" y="1" width="8" height="8" fill="hsla(240deg, 80%, 50%, .6)"/>
+  <rect x="31" y="1" width="8" height="8" fill="#f808"/>
+  <rect x="1" y="11" width="8" height="8" fill="#0080ff80"/>
+  <rect x="11" y="11" width="8" height="8" fill="SteelBlue"/>
+  <rect x="21" y="11" width="8" height="8" fill="rgb(20 40 60 / 50%)"/>
+  <rect x="31" y="11" width="8" height="8" fill="#ABC"/>
+</svg>

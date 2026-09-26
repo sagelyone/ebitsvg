@@ -1,37 +1,52 @@
 // Copyright 2017 The oksvg Authors. All rights reserved.
 // created: 2/12/2017 by S.R.Wiley
-//
-// utils.go implements translation of an SVG2.0 path into a rasterx Path.
 
 package oksvg
 
 import (
+	"image"
+
 	"github.com/srwiley/rasterx"
 )
 
-// SvgIcon holds data from parsed SVGs.
-type SvgIcon struct {
-	ViewBox      struct{ X, Y, W, H float64 }
-	Titles       []string // Title elements collect here
-	Descriptions []string // Description elements collect here
-	Grads        map[string]*rasterx.Gradient
-	Defs         map[string][]definition
-	SVGPaths     []SvgPath
-	Transform    rasterx.Matrix2D
-	classes      map[string]styleAttribute
+// Icon is a parsed SVG document.
+type Icon struct {
+	ViewBox Box
+
+	grads     map[string]*rasterx.Gradient
+	paths     []svgPath
+	pathScale float64 // path units per user unit
 }
 
-// Draw the compiled SVG icon into the GraphicContext.
-// All elements should be contained by the Bounds rectangle of the SvgIcon.
-func (s *SvgIcon) Draw(r *rasterx.Dasher, opacity float64) {
-	for _, svgp := range s.SVGPaths {
-		svgp.DrawTransformed(r, opacity, s.Transform)
+// Box is a rectangle with its origin at (X, Y).
+type Box struct{ X, Y, W, H float64 }
+
+// Draw draws the icon into img, whose origin must be at (0, 0), mapping its
+// user space through t. It does not modify the icon, so an icon can be drawn
+// concurrently.
+func (icon *Icon) Draw(img *image.RGBA, t rasterx.Matrix2D) {
+	w, h := img.Rect.Dx(), img.Rect.Dy()
+	r := &renderer{Dasher: rasterx.NewDasher(w, h, rasterx.NewScannerGV(w, h, img, img.Rect)), img: img}
+	for i := range icon.paths {
+		icon.paths[i].draw(r, t, icon.pathScale, icon.grads)
 	}
 }
 
-// SetTarget sets the Transform matrix to draw within the bounds of the rectangle arguments
-func (s *SvgIcon) SetTarget(x, y, w, h float64) {
-	scaleW := w / s.ViewBox.W
-	scaleH := h / s.ViewBox.H
-	s.Transform = rasterx.Identity.Translate(x-s.ViewBox.X, y-s.ViewBox.Y).Scale(scaleW, scaleH)
+// renderer draws paths into an image.
+type renderer struct {
+	*rasterx.Dasher
+	img     *image.RGBA
+	evenOdd *rasterx.Filler // made when needed
+}
+
+// filler returns a filler with the given fill rule.
+func (r *renderer) filler(evenOdd bool) *rasterx.Filler {
+	if !evenOdd {
+		return &r.Filler
+	}
+	if r.evenOdd == nil {
+		w, h := r.img.Rect.Dx(), r.img.Rect.Dy()
+		r.evenOdd = rasterx.NewFiller(w, h, newEvenOddScanner(r.img))
+	}
+	return r.evenOdd
 }

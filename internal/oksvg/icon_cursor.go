@@ -1,7 +1,5 @@
 // Copyright 2017 The oksvg Authors. All rights reserved.
 // created: 2/12/2017 by S.R.Wiley
-//
-// utils.go implements translation of an SVG2.0 path into a rasterx Path.
 
 package oksvg
 
@@ -9,383 +7,427 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"image/color"
-	"log"
+	"maps"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/srwiley/rasterx"
 )
 
-// IconCursor is used while parsing SVG files.
-type IconCursor struct {
-	PathCursor
-	icon                                                 *SvgIcon
-	StyleStack                                           []PathStyle
-	grad                                                 *rasterx.Gradient
-	inTitleText, inDescText, inGrad, inDefs, inDefsStyle bool
-	currentDef                                           []definition
+// maxMiterLimit bounds miter limits to keep miters, which rasterx measures
+// in fixed point, in its range.
+const maxMiterLimit = 32
+
+// iconCursor holds the state of parsing an SVG document into an icon.
+type iconCursor struct {
+	pathCursor
+	icon      *Icon
+	styles    []pathStyle // the styles of the open elements
+	grad      *rasterx.Gradient
+	gradDepth int // the number of open gradient elements
+	defsDepth int // the number of open <defs> elements
+	defs      []definition
+	defIDs    map[string]int // the indexes in defs of the elements with ids
+	classes   map[string]styleAttribute
+	gradDefs  map[*rasterx.Gradient]*gradDef
+	using     map[string]bool // the ids of the <use> elements being expanded
+	expanded  int             // the cost of expanded <use> elements
 }
 
-// ReadGradURL reads an SVG format gradient url
-// Since the context of the gradient can affect the colors
-// the current fill or line color is passed in and used in
-// the case of a nil stopClor value
-func (c *IconCursor) ReadGradURL(v string, defaultColor interface{}) (grad rasterx.Gradient, ok bool) {
-	if strings.HasPrefix(v, "url(") && strings.HasSuffix(v, ")") {
-		urlStr := strings.TrimSpace(v[4 : len(v)-1])
-		if strings.HasPrefix(urlStr, "#") {
-			var g *rasterx.Gradient
-			g, ok = c.icon.Grads[urlStr[1:]]
-			if ok {
-				grad = localizeGradIfStopClrNil(g, defaultColor)
-			}
-		}
+// definition records the start of an element in <defs>, or its end if tag
+// is empty.
+type definition struct {
+	tag   string
+	attrs []xml.Attr
+}
+
+// gradPoints maps the geometry attributes of linear and radial gradients to
+// their indexes in rasterx.Gradient.Points.
+var gradPoints = map[bool]map[string]int{
+	false: {"x1": 0, "y1": 1, "x2": 2, "y2": 3},
+	true:  {"cx": 0, "cy": 1, "fx": 2, "fy": 3, "r": 4},
+}
+
+var (
+	gradUnits = map[string]rasterx.GradientUnits{
+		"userSpaceOnUse": rasterx.UserSpaceOnUse, "objectBoundingBox": rasterx.ObjectBoundingBox,
 	}
-	return
-}
-
-// ReadGradAttr reads an SVG gradient attribute
-func (c *IconCursor) ReadGradAttr(attr xml.Attr) (err error) {
-	switch attr.Name.Local {
-	case "gradientTransform":
-		c.grad.Matrix, err = c.parseTransform(attr.Value)
-	case "gradientUnits":
-		switch strings.TrimSpace(attr.Value) {
-		case "userSpaceOnUse":
-			c.grad.Units = rasterx.UserSpaceOnUse
-		case "objectBoundingBox":
-			c.grad.Units = rasterx.ObjectBoundingBox
-		}
-	case "spreadMethod":
-		switch strings.TrimSpace(attr.Value) {
-		case "pad":
-			c.grad.Spread = rasterx.PadSpread
-		case "reflect":
-			c.grad.Spread = rasterx.ReflectSpread
-		case "repeat":
-			c.grad.Spread = rasterx.RepeatSpread
-		}
+	spreadMethods = map[string]rasterx.SpreadMethod{
+		"pad": rasterx.PadSpread, "reflect": rasterx.ReflectSpread, "repeat": rasterx.RepeatSpread,
 	}
-	return
+)
+
+// gradDef records the attributes a gradient element sets itself, which
+// gradients that reference it inherit unless they set them too.
+type gradDef struct {
+	href string
+	set  map[string]bool
 }
 
-// PushStyle parses the style element, and push it on the style stack. Only color and opacity are supported
-// for fill. Note that this parses both the contents of a style attribute plus
-// direct fill and opacity attributes.
-func (c *IconCursor) PushStyle(attrs []xml.Attr) error {
-	var pairs []string
-	className := ""
+// readGradient reads the attributes of a gradient element into g, which
+// then collects its stops.
+func (c *iconCursor) readGradient(g *rasterx.Gradient, attrs []xml.Attr) error {
+	c.grad = g
+	def := &gradDef{set: make(map[string]bool)}
+	c.gradDefs[g] = def
 	for _, attr := range attrs {
-		switch strings.ToLower(attr.Name.Local) {
-		case "style":
-			pairs = append(pairs, strings.Split(attr.Value, ";")...)
-		case "class":
-			className = attr.Value
+		k, v := attr.Name.Local, attr.Value
+		var ok bool
+		var err error
+		switch k {
+		case "id":
+			c.icon.grads[v] = g
+		case "href":
+			def.href, _ = strings.CutPrefix(v, "#")
+		case "gradientTransform":
+			g.Matrix, err = c.parseTransform(v, rasterx.Identity)
+			ok = err == nil
+		case "gradientUnits":
+			var u rasterx.GradientUnits
+			if u, ok = gradUnits[strings.TrimSpace(v)]; ok {
+				g.Units = u
+			}
+		case "spreadMethod":
+			var m rasterx.SpreadMethod
+			if m, ok = spreadMethods[strings.TrimSpace(v)]; ok {
+				g.Spread = m
+			}
 		default:
-			pairs = append(pairs, attr.Name.Local+":"+attr.Value)
-		}
-	}
-	// Make a copy of the top style
-	curStyle := c.StyleStack[len(c.StyleStack)-1]
-	for _, pair := range pairs {
-		kv := strings.Split(pair, ":")
-		if len(kv) >= 2 {
-			k := strings.ToLower(kv[0])
-			k = strings.TrimSpace(k)
-			v := strings.TrimSpace(kv[1])
-			err := c.readStyleAttr(&curStyle, k, v)
-			if err != nil {
-				return err
+			var i int
+			if i, ok = gradPoints[g.IsRadial][k]; ok {
+				g.Points[i], err = readFraction(v)
 			}
 		}
+		if err != nil {
+			return err
+		}
+		if ok {
+			def.set[k] = true
+		}
 	}
-	c.adaptClasses(&curStyle, className)
-	c.StyleStack = append(c.StyleStack, curStyle) // Push style onto stack
+	setFocus(g, def.set)
 	return nil
 }
 
-func (c *IconCursor) readTransformAttr(m1 rasterx.Matrix2D, k string) (rasterx.Matrix2D, error) {
-	ln := len(c.points)
-	switch k {
+// setFocus places the focus of a radial gradient at its center unless set.
+func setFocus(g *rasterx.Gradient, set map[string]bool) {
+	if !g.IsRadial {
+		return
+	}
+	if !set["fx"] {
+		g.Points[2] = g.Points[0]
+	}
+	if !set["fy"] {
+		g.Points[3] = g.Points[1]
+	}
+}
+
+// resolveGradHrefs gives gradients the attributes they do not set, and
+// their stops if they have none, from the gradients they reference,
+// directly or through others.
+func (c *iconCursor) resolveGradHrefs() {
+	for g, def := range c.gradDefs {
+		set := maps.Clone(def.set)
+		id := def.href
+		for range len(c.gradDefs) {
+			ref := c.icon.grads[id]
+			if id == "" || ref == nil || ref == g {
+				break
+			}
+			refDef := c.gradDefs[ref]
+			for k := range refDef.set {
+				if set[k] {
+					continue
+				}
+				switch k {
+				case "gradientTransform":
+					g.Matrix = ref.Matrix
+				case "gradientUnits":
+					g.Units = ref.Units
+				case "spreadMethod":
+					g.Spread = ref.Spread
+				default:
+					if g.IsRadial != ref.IsRadial {
+						continue
+					}
+					i := gradPoints[g.IsRadial][k]
+					g.Points[i] = ref.Points[i]
+				}
+				set[k] = true
+			}
+			if len(g.Stops) == 0 {
+				g.Stops = ref.Stops
+			}
+			id = refDef.href
+		}
+		setFocus(g, set)
+	}
+}
+
+// pushStyle parses the style of an element and pushes it on the style stack.
+// Presentation attributes apply first, then class rules, then the style
+// attribute; color applies before the other properties, which may refer to
+// it as currentColor.
+func (c *iconCursor) pushStyle(attrs []xml.Attr) error {
+	var decls [][2]string
+	var class, inline string
+	for _, attr := range attrs {
+		switch k := strings.ToLower(attr.Name.Local); k {
+		case "style":
+			inline = attr.Value
+		case "class":
+			class = attr.Value
+		default:
+			decls = append(decls, [2]string{k, attr.Value})
+		}
+	}
+	for _, name := range strings.Fields(class) {
+		for k, v := range c.classes[name] {
+			decls = append(decls, [2]string{k, v})
+		}
+	}
+	for _, pair := range strings.Split(stripComments(inline), ";") {
+		if k, v, ok := strings.Cut(pair, ":"); ok {
+			decls = append(decls, [2]string{strings.ToLower(strings.TrimSpace(k)), v})
+		}
+	}
+	style := c.styles[len(c.styles)-1]
+	inherited := style.opacity
+	style.opacity = 1
+	for _, colorFirst := range []bool{true, false} {
+		for _, d := range decls {
+			k, v := d[0], strings.TrimSpace(d[1])
+			if (k == "color") != colorFirst || v == "inherit" {
+				continue
+			}
+			if err := c.readStyleAttr(&style, k, v); err != nil {
+				return fmt.Errorf("unsupported attribute or style value %s=%q: %w", k, v, err)
+			}
+		}
+	}
+	style.opacity *= inherited
+	c.styles = append(c.styles, style)
+	return nil
+}
+
+// applyTransform returns m followed by the transform name with the
+// arguments in the cursor's points.
+func (c *iconCursor) applyTransform(m rasterx.Matrix2D, name string) (rasterx.Matrix2D, error) {
+	p := c.points
+	n := len(p)
+	switch strings.ToLower(name) {
 	case "rotate":
-		if ln == 1 {
-			m1 = m1.Rotate(c.points[0] * math.Pi / 180)
-		} else if ln == 3 {
-			m1 = m1.Translate(c.points[1], c.points[2]).
-				Rotate(c.points[0]*math.Pi/180).
-				Translate(-c.points[1], -c.points[2])
-		} else {
-			return m1, errParamMismatch
+		switch n {
+		case 1:
+			return m.Rotate(p[0] * math.Pi / 180), nil
+		case 3:
+			return m.Translate(p[1], p[2]).Rotate(p[0]*math.Pi/180).Translate(-p[1], -p[2]), nil
 		}
 	case "translate":
-		if ln == 1 {
-			m1 = m1.Translate(c.points[0], 0)
-		} else if ln == 2 {
-			m1 = m1.Translate(c.points[0], c.points[1])
-		} else {
-			return m1, errParamMismatch
+		switch n {
+		case 1:
+			return m.Translate(p[0], 0), nil
+		case 2:
+			return m.Translate(p[0], p[1]), nil
 		}
 	case "skewx":
-		if ln == 1 {
-			m1 = m1.SkewX(c.points[0] * math.Pi / 180)
-		} else {
-			return m1, errParamMismatch
+		if n == 1 {
+			return m.SkewX(p[0] * math.Pi / 180), nil
 		}
 	case "skewy":
-		if ln == 1 {
-			m1 = m1.SkewY(c.points[0] * math.Pi / 180)
-		} else {
-			return m1, errParamMismatch
+		if n == 1 {
+			return m.SkewY(p[0] * math.Pi / 180), nil
 		}
 	case "scale":
-		if ln == 1 {
-			m1 = m1.Scale(c.points[0], 0)
-		} else if ln == 2 {
-			m1 = m1.Scale(c.points[0], c.points[1])
-		} else {
-			return m1, errParamMismatch
+		switch n {
+		case 1:
+			return m.Scale(p[0], p[0]), nil
+		case 2:
+			return m.Scale(p[0], p[1]), nil
 		}
 	case "matrix":
-		if ln == 6 {
-			m1 = m1.Mult(rasterx.Matrix2D{
-				A: c.points[0],
-				B: c.points[1],
-				C: c.points[2],
-				D: c.points[3],
-				E: c.points[4],
-				F: c.points[5]})
-		} else {
-			return m1, errParamMismatch
+		if n == 6 {
+			return m.Mult(rasterx.Matrix2D{A: p[0], B: p[1], C: p[2], D: p[3], E: p[4], F: p[5]}), nil
 		}
 	default:
-		return m1, errParamMismatch
+		return m, fmt.Errorf("unknown transform %q", name)
 	}
-	return m1, nil
+	return m, fmt.Errorf("wrong number of arguments to %s", name)
 }
 
-func (c *IconCursor) parseTransform(v string) (rasterx.Matrix2D, error) {
-	ts := strings.Split(v, ")")
-	m1 := c.StyleStack[len(c.StyleStack)-1].mAdder.M
-	for _, t := range ts {
+// parseTransform returns m followed by the transform list v.
+func (c *iconCursor) parseTransform(v string, m rasterx.Matrix2D) (rasterx.Matrix2D, error) {
+	for t := range strings.SplitSeq(v, ")") {
 		t = strings.TrimSpace(t)
-		if len(t) == 0 {
+		if t == "" {
 			continue
 		}
-		d := strings.Split(t, "(")
-		if len(d) != 2 || len(d[1]) < 1 {
-			return m1, errParamMismatch // badly formed transformation
+		name, args, ok := strings.Cut(t, "(")
+		if !ok || args == "" || strings.Contains(args, "(") {
+			return m, errors.New("invalid transform syntax")
 		}
-		err := c.GetPoints(d[1])
-		if err != nil {
-			return m1, err
-		}
-		m1, err = c.readTransformAttr(m1, strings.ToLower(strings.TrimSpace(d[0])))
-		if err != nil {
-			return m1, err
-		}
-	}
-	return m1, nil
-}
-
-func (c *IconCursor) readStyleAttr(curStyle *PathStyle, k, v string) error {
-	switch k {
-	case "fill":
-		gradient, ok := c.ReadGradURL(v, curStyle.fillerColor)
-		if ok {
-			curStyle.fillerColor = gradient
-			break
+		if err := c.getPoints(args, false); err != nil {
+			return m, err
 		}
 		var err error
-		curStyle.fillerColor, err = ParseSVGColor(v)
-		return err
+		if m, err = c.applyTransform(m, strings.Trim(name, " \t\r\n,")); err != nil {
+			return m, err
+		}
+	}
+	return m, nil
+}
+
+// readStyleAttr sets the property k of style to the value v.
+func (c *iconCursor) readStyleAttr(style *pathStyle, k, v string) error {
+	var err error
+	switch k {
+	case "fill":
+		style.fill, err = parsePaint(v, style.color)
 	case "stroke":
-		gradient, ok := c.ReadGradURL(v, curStyle.linerColor)
-		if ok {
-			curStyle.linerColor = gradient
-			break
+		style.stroke, err = parsePaint(v, style.color)
+	case "color":
+		style.color, err = parseColor(v, style.color)
+	case "stop-color":
+		style.stopColor, err = parseColor(v, style.color)
+	case "fill-rule":
+		style.evenOdd = v == "evenodd"
+	case "display":
+		if v == "none" {
+			style.hidden = true
 		}
-		col, errc := ParseSVGColor(v)
-		if errc != nil {
-			return errc
-		}
-		if col != nil {
-			curStyle.linerColor = col.(color.NRGBA)
-		} else {
-			curStyle.linerColor = nil
-		}
-	case "stroke-linegap":
-		switch v {
-		case "flat":
-			curStyle.LineGap = rasterx.FlatGap
-		case "round":
-			curStyle.LineGap = rasterx.RoundGap
-		case "cubic":
-			curStyle.LineGap = rasterx.CubicGap
-		case "quadratic":
-			curStyle.LineGap = rasterx.QuadraticGap
-		}
-	case "stroke-leadlinecap":
-		switch v {
-		case "butt":
-			curStyle.LeadLineCap = rasterx.ButtCap
-		case "round":
-			curStyle.LeadLineCap = rasterx.RoundCap
-		case "square":
-			curStyle.LeadLineCap = rasterx.SquareCap
-		case "cubic":
-			curStyle.LeadLineCap = rasterx.CubicCap
-		case "quadratic":
-			curStyle.LeadLineCap = rasterx.QuadraticCap
-		}
+	case "visibility":
+		style.invisible = v == "hidden" || v == "collapse"
 	case "stroke-linecap":
 		switch v {
 		case "butt":
-			curStyle.LineCap = rasterx.ButtCap
+			style.lineCap = rasterx.ButtCap
 		case "round":
-			curStyle.LineCap = rasterx.RoundCap
+			style.lineCap = rasterx.RoundCap
 		case "square":
-			curStyle.LineCap = rasterx.SquareCap
+			style.lineCap = rasterx.SquareCap
 		case "cubic":
-			curStyle.LineCap = rasterx.CubicCap
+			style.lineCap = rasterx.CubicCap
 		case "quadratic":
-			curStyle.LineCap = rasterx.QuadraticCap
+			style.lineCap = rasterx.QuadraticCap
 		}
 	case "stroke-linejoin":
 		switch v {
 		case "miter":
-			curStyle.LineJoin = rasterx.Miter
+			style.lineJoin = rasterx.Miter
 		case "miter-clip":
-			curStyle.LineJoin = rasterx.MiterClip
+			style.lineJoin = rasterx.MiterClip
 		case "arc-clip":
-			curStyle.LineJoin = rasterx.ArcClip
+			style.lineJoin = rasterx.ArcClip
 		case "round":
-			curStyle.LineJoin = rasterx.Round
-		case "arc":
-			curStyle.LineJoin = rasterx.Arc
+			style.lineJoin = rasterx.Round
+		case "arc", "arcs":
+			style.lineJoin = rasterx.Arc
 		case "bevel":
-			curStyle.LineJoin = rasterx.Bevel
+			style.lineJoin = rasterx.Bevel
 		}
 	case "stroke-miterlimit":
-		mLimit, err := parseFloat(v, 64)
-		if err != nil {
-			return err
+		var limit float64
+		if limit, err = parseNumber(v); err == nil {
+			style.miterLimit = min(max(limit, 1), maxMiterLimit)
 		}
-		curStyle.MiterLimit = mLimit
 	case "stroke-width":
-		width, err := parseFloat(v, 64)
-		if err != nil {
-			return err
+		var width float64
+		if width, err = parseLength(v); err == nil && width < 0 {
+			err = errNegative
 		}
-		curStyle.LineWidth = width
+		style.lineWidth = width
 	case "stroke-dashoffset":
-		dashOffset, err := parseFloat(v, 64)
-		if err != nil {
-			return err
-		}
-		curStyle.DashOffset = dashOffset
+		style.dashOffset, err = parseLength(v)
 	case "stroke-dasharray":
-		if v != "none" {
-			dashes := splitOnCommaOrSpace(v)
-			dList := make([]float64, len(dashes))
-			for i, dstr := range dashes {
-				d, err := parseFloat(strings.TrimSpace(dstr), 64)
-				if err != nil {
-					return err
-				}
-				dList[i] = d
-			}
-			curStyle.Dash = dList
+		if v == "none" {
+			style.dash = nil
 			break
 		}
-	case "opacity", "stroke-opacity", "fill-opacity":
-		op, err := parseFloat(v, 64)
-		if err != nil {
+		fields := splitOnCommaOrSpace(v)
+		dash := make([]float64, len(fields))
+		for i, f := range fields {
+			d, err := parseLength(f)
+			if err != nil {
+				return err
+			}
+			if d < 0 {
+				return errNegative
+			}
+			dash[i] = d
+		}
+		style.dash = dash
+	case "opacity", "stroke-opacity", "fill-opacity", "stop-opacity":
+		var op float64
+		if op, err = readFraction(v); err != nil {
 			return err
 		}
-		if k != "stroke-opacity" {
-			curStyle.FillOpacity *= op
-		}
-		if k != "fill-opacity" {
-			curStyle.LineOpacity *= op
+		op = min(max(op, 0), 1)
+		switch k {
+		case "opacity":
+			style.opacity = op
+		case "stroke-opacity":
+			style.lineOpacity = op
+		case "fill-opacity":
+			style.fillOpacity = op
+		case "stop-opacity":
+			style.stopOpacity = op
 		}
 	case "transform":
-		m, err := c.parseTransform(v)
-		if err != nil {
-			return err
-		}
-		curStyle.mAdder.M = m
+		style.transform, err = c.parseTransform(v, style.transform)
 	}
+	return err
+}
+
+// recorded reports whether an element is recorded in defs rather than drawn:
+// it is in <defs> and is not a gradient or in one.
+func (c *iconCursor) recorded(tag string) bool {
+	return c.defsDepth > 0 && c.gradDepth == 0 && !isGradient(tag)
+}
+
+func isGradient(tag string) bool {
+	return tag == "linearGradient" || tag == "radialGradient"
+}
+
+// readStartElement draws an element or, in <defs>, records it for <use>.
+func (c *iconCursor) readStartElement(se xml.StartElement) error {
+	if !c.recorded(se.Name.Local) {
+		return c.drawElement(se.Name.Local, se.Attr)
+	}
+	for _, attr := range se.Attr {
+		if attr.Name.Local == "id" {
+			if _, dup := c.defIDs[attr.Value]; !dup {
+				c.defIDs[attr.Value] = len(c.defs)
+			}
+		}
+	}
+	c.defs = append(c.defs, definition{se.Name.Local, se.Attr})
 	return nil
 }
 
-func (c *IconCursor) readStartElement(se xml.StartElement) (err error) {
-	var skipDef bool
-	if se.Name.Local == "radialGradient" || se.Name.Local == "linearGradient" || c.inGrad {
-		skipDef = true
+func (c *iconCursor) readEndElement(tag string) {
+	if c.recorded(tag) {
+		c.defs = append(c.defs, definition{})
 	}
-	if c.inDefs && !skipDef {
-		ID := ""
-		for _, attr := range se.Attr {
-			if attr.Name.Local == "id" {
-				ID = attr.Value
-			}
-		}
-		if ID != "" && len(c.currentDef) > 0 {
-			c.icon.Defs[c.currentDef[0].ID] = c.currentDef
-			c.currentDef = make([]definition, 0)
-		}
-		c.currentDef = append(c.currentDef, definition{
-			ID:    ID,
-			Tag:   se.Name.Local,
-			Attrs: se.Attr,
-		})
-		return nil
-	}
-	df, ok := drawFuncs[se.Name.Local]
-	if !ok {
-		errStr := "Cannot process svg element " + se.Name.Local
-		if c.returnError(errStr) {
-			return errors.New(errStr)
-		}
-		return nil
-	}
-	err = df(c, se.Attr)
-	if err != nil {
-		e := fmt.Sprintf("error during processing svg element %s: %s", se.Name.Local, err.Error())
-		if c.returnError(e) {
-			err = errors.New(e)
-		}
-		err = nil
-	}
+}
 
+// drawElement adds the paths of an element whose style is on top of the
+// stack. An invalid element is drawn up to the first error, which is
+// returned only for <use>, whose errors are fatal.
+func (c *iconCursor) drawElement(tag string, attrs []xml.Attr) error {
+	df, ok := drawFuncs[tag]
+	if !ok {
+		return nil
+	}
+	if err := df(c, attrs); err != nil && tag == "use" {
+		return err
+	}
 	if len(c.Path) > 0 {
-		//The cursor parsed a path from the xml element
-		pathCopy := make(rasterx.Path, len(c.Path))
-		copy(pathCopy, c.Path)
-		c.icon.SVGPaths = append(c.icon.SVGPaths,
-			SvgPath{c.StyleStack[len(c.StyleStack)-1], pathCopy})
+		style := c.styles[len(c.styles)-1]
+		if !style.hidden && !style.invisible {
+			c.icon.paths = append(c.icon.paths, svgPath{style, slices.Clone(c.Path)})
+		}
 		c.Path = c.Path[:0]
 	}
-	return
-}
-
-func (c *IconCursor) adaptClasses(pathStyle *PathStyle, className string) {
-	if className == "" || len(c.icon.classes) == 0 {
-		return
-	}
-	for k, v := range c.icon.classes[className] {
-		c.readStyleAttr(pathStyle, k, v)
-	}
-}
-
-func (c *IconCursor) returnError(errMsg string) bool {
-	if c.ErrorMode == StrictErrorMode {
-		return true
-	}
-	if c.ErrorMode == WarnErrorMode {
-		log.Println(errMsg)
-	}
-
-	return false
+	return nil
 }
