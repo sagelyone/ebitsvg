@@ -193,6 +193,14 @@ Tests need a display. On headless Linux, run them with `xvfb-run -a go test
 ./...`. The reference images in `testdata` are rendered with `rsvg-convert`;
 the comment on `TestReference` in `svg_test.go` gives the command.
 
+`BenchmarkParse` and `BenchmarkRasterize` measure the SVGs in `testdata`.
+`internal/cmd/probe` measures how long the first `Parse` takes and how much
+memory ebitsvg uses on Linux:
+
+```sh
+go run ./internal/cmd/probe [-size n] file.svg
+```
+
 `internal/resvg/internal/shim` is generated and committed, so that building
 ebitsvg needs no Rust. To regenerate it and
 `internal/resvg/THIRD_PARTY_NOTICES` after changing `internal/resvg/shim`,
