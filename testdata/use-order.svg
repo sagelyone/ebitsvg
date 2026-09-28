@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+  <use href="#dot" x="-6" y="-6"/>
+  <use href="#dot" x="6" y="6" fill="#c33"/>
+  <circle id="dot" cx="12" cy="12" r="5"/>
+  <use href="#dot" x="6" y="-6" fill="#3c3"/>
+</svg>
