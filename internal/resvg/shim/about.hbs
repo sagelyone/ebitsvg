@@ -1,0 +1,10 @@
+internal/shim, which ebitsvg links, is translated from these Rust crates,
+compiled to WebAssembly. Their licenses follow, each with the crates it covers.
+{{#each licenses}}
+
+================================================================================
+{{{name}}}: {{#each used_by}}{{crate.name}} {{crate.version}}{{#unless @last}}, {{/unless}}{{/each}}
+================================================================================
+
+{{{text}}}
+{{/each}}

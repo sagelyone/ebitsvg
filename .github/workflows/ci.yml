@@ -22,7 +22,8 @@ jobs:
           sudo apt-get install -y libgl1 libgl1-mesa-dri libx11-6 libxcursor1 libxext6 libxi6 libxinerama1 libxrandr2 libxrender1 xvfb
       - run: test -z "$(gofmt -l . | tee /dev/stderr)"
       - run: go mod tidy -diff
-      - run: go vet ./...
+      # wasm2go's output has unreachable code, which vet reports.
+      - run: go vet $(go list ./... | grep -v /internal/shim$)
       - run: xvfb-run -a go test -race ./...
       - run: GOOS=js GOARCH=wasm go build ./...
       - run: GOOS=windows go build ./...
@@ -37,5 +38,74 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version: stable
-      - run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      # wasm2go's output has unused values, which staticcheck reports.
+      - run: go run honnef.co/go/tools/cmd/staticcheck@latest $(go list ./... | grep -v /internal/shim$)
       - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+  # This runs the renderer's tests on architectures and systems that the
+  # test job does not. TestPixels checks that they all render the same
+  # pixels, as WebAssembly's semantics require.
+  renderer:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-24.04-arm
+          - os: macos-latest
+          - os: windows-latest
+          - os: ubuntu-latest
+            goarch: "386"
+          # Big-endian, for which the translation byte-swaps memory.
+          - os: ubuntu-latest
+            goarch: s390x
+            exec: qemu-s390x
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - if: matrix.exec
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+      - run: go test ${{ matrix.exec && format('-exec={0}', matrix.exec) || '' }} ./internal/resvg
+        env:
+          GOARCH: ${{ matrix.goarch }}
+
+  renderer-js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      # Go's wasm loader rejects environments larger than a few kilobytes.
+      - run: env -i PATH="$(go env GOROOT)/lib/wasm:$PATH" HOME="$HOME" GOOS=js GOARCH=wasm go test ./internal/resvg
+
+  # The renderer's Go translation and its notices are committed so that
+  # building ebitsvg needs no Rust. This checks that they are what their
+  # sources build.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # wasm2go needs a newer Go than the minimum go.mod declares.
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+      - run: rustup toolchain install
+        working-directory: internal/resvg/shim
+      - run: cargo install --locked cargo-about@0.8.4
+      - run: |
+          curl -sSfL https://github.com/WebAssembly/binaryen/releases/download/version_130/binaryen-version_130-x86_64-linux.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/binaryen-version_130/bin" >> "$GITHUB_PATH"
+      - run: go generate ./internal/resvg
+      - run: git diff --exit-code
+
+  # govulncheck cannot see the Rust crates the renderer is translated from.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo install --locked cargo-audit
+      - run: cargo audit --file internal/resvg/shim/Cargo.lock
