@@ -501,6 +501,12 @@ func TestReference(t *testing.T) {
 			}
 			mad := float64(sum) / float64(len(got.Pix))
 			t.Logf("MAD %.2f", mad)
+			if why, ok := knownDifferences[name]; ok {
+				if mad <= referenceTolerance {
+					t.Fatalf("mean absolute difference %.2f is within tolerance; remove %s from knownDifferences", mad, name)
+				}
+				t.Skipf("known difference: %s", why)
+			}
 			if mad > referenceTolerance {
 				t.Errorf("mean absolute difference %.2f; want at most %v", mad, referenceTolerance)
 			}
@@ -514,6 +520,14 @@ func TestReference(t *testing.T) {
 // but reach 2.23 at 24 px; the rendering bugs this guards against measured
 // 2.4 to 105, and resvg's color and gradient bugs 17 to 20.
 const referenceTolerance = 2.3
+
+// knownDifferences holds the SVGs that resvg renders differently from their
+// references, and why. TestReference skips them, but fails once one
+// matches, so that its entry is removed.
+var knownDifferences = map[string]string{
+	"colors":    "svgtypes does not parse CSS Color 4 syntax, such as rgb(0 0 0 / 50%)",
+	"grad-href": "usvg does not inherit gradientTransform through href",
+}
 
 func abs(v int) int { return max(v, -v) }
 
