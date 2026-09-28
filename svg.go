@@ -35,9 +35,10 @@ type SVG struct {
 // compressed (.svgz) or encoded other than as UTF-8 or ASCII, whose size
 // cannot be determined (see [SVG.Size]), that are not well-formed XML,
 // which includes using entities other than XML's own and those the DOCTYPE
-// declares, such as &nbsp;, or that have too many elements, including
-// those <use> elements copy, which a cycle of them makes unbounded. It reads
-// all of r: to parse untrusted input, limit its size with [io.LimitReader].
+// declares, such as &nbsp;, that have too many elements, including those
+// <use> elements copy, which a cycle of them makes unbounded, or that nest
+// elements more than 256 deep. It reads all of r: to parse untrusted input,
+// limit its size with [io.LimitReader].
 func Parse(r io.Reader) (*SVG, error) {
 	b, err := io.ReadAll(r)
 	if err != nil {

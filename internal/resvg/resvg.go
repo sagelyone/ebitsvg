@@ -118,6 +118,8 @@ func (in *instance) parseError() error {
 		return errors.New("too many elements")
 	case 4:
 		return errors.New("input must be UTF-8 or ASCII")
+	case 5:
+		return errors.New("elements nested too deeply")
 	}
 	ptr, n := uint32(in.mod.Xerror_ptr()), uint32(in.mod.Xerror_len())
 	return fmt.Errorf("XML syntax error: %s", in.memory()[ptr:ptr+n])

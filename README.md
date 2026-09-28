@@ -166,8 +166,9 @@ be determined (see `SVG.Size`), or that are not well-formed XML, which
 includes using entities other than XML's own and those the DOCTYPE declares,
 such as `&nbsp;`, and namespace prefixes such as `xlink:` that are not
 declared. It also rejects documents with too many elements, including those
-`<use>` elements copy, which a cycle of them makes unbounded. It reads all of
-its input: to parse untrusted input, limit its size with `io.LimitReader`.
+`<use>` elements copy, which a cycle of them makes unbounded, and documents
+that nest elements more than 256 deep. It reads all of its input: to parse
+untrusted input, limit its size with `io.LimitReader`.
 
 If rasterizing needs more memory than the renderer may use, 256 MiB, which a
 filter over a large raster can, the raster is transparent.

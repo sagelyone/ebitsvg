@@ -76,6 +76,28 @@ func fanOut(n, depth int) string {
 	return b.String()
 }
 
+// nest returns an SVG document whose root holds inner in n nested <g>
+// elements, so that inner's elements are n+2 deep.
+func nest(n int, inner string) string {
+	return `<svg viewBox="0 0 1 1">` + strings.Repeat("<g>", n) + inner + strings.Repeat("</g>", n) + "</svg>"
+}
+
+// TestParseNesting checks that Parse accepts elements nested 256 deep, and
+// that it counts only elements.
+func TestParseNesting(t *testing.T) {
+	for _, src := range []string{
+		nest(255, ""),
+		nest(254, `<rect width="1" height="1"/>`),
+		nest(254, `<g id="/>"><!-- `+strings.Repeat("<g>", 300)+` --></g>`),
+		nest(254, `<text><![CDATA[`+strings.Repeat("<g>", 300)+`]]></text>`),
+		`<!DOCTYPE svg [<!ENTITY e "http://www.w3.org/2000/svg"><!-- "<g>" -->]>` + nest(255, ""),
+	} {
+		if _, err := Parse(strings.NewReader(src)); err != nil {
+			t.Errorf("Parse(%.60q…): %v", src[len(src)/2:], err)
+		}
+	}
+}
+
 func TestParseErrors(t *testing.T) {
 	tests := []struct{ src, want string }{
 		{``, "not an SVG document"},
@@ -104,6 +126,13 @@ func TestParseErrors(t *testing.T) {
 		{"\x1f\x8b\x08\x00\x00\x00\x00\x00", "gzip-compressed input (.svgz): decompress it first"},
 		{`<svg viewBox="0 0 1 1"><rect width="1" height="1"/>` + "\xff</svg>", "input must be UTF-8 or ASCII"},
 		{fanOut(10, 6), "too many elements"},
+		{nest(256, ""), "elements nested too deeply"},
+		{nest(255, `<g id="/>"></g>`), "elements nested too deeply"},
+		{nest(100000, ""), "elements nested too deeply"},
+		{`<!DOCTYPE svg [<!ENTITY e "` + strings.Repeat("<g>", 26) + strings.Repeat("</g>", 26) + `">]><svg viewBox="0 0 1 1">&e;</svg>`,
+			"elements nested too deeply"},
+		{`<!DOCTYPE svg [<!ENTITY e "` + strings.Repeat("<g>", 25) + "&e;" + strings.Repeat("</g>", 25) + `">]><svg viewBox="0 0 1 1">&e;</svg>`,
+			"XML syntax error"},
 	}
 	for _, tt := range tests {
 		_, err := Parse(strings.NewReader(tt.src))
