@@ -2,7 +2,9 @@
 // and translated to Go by wasm2go in the package shim.
 //
 // Each call runs in an instance of the module that no other call uses at
-// the same time; idle instances are pooled, up to GOMAXPROCS of them.
+// the same time; idle instances are pooled, up to GOMAXPROCS of them. Each
+// instance keeps the trees of the documents it parsed, so that rendering a
+// [Doc] again in the same instance skips parsing it.
 package resvg
 
 import (
@@ -18,39 +20,50 @@ import (
 // shrinks, so larger ones are dropped to give their memory back.
 const pooledLimit = 32 << 20
 
+// A pool holds up to max idle instances. It hands out the one released
+// last, so that a goroutine that renders documents one after another keeps
+// using the instance that holds their trees.
 type pool struct {
-	idle chan *instance
+	mu   sync.Mutex
+	idle []*instance
+	max  int
 }
 
 var instances = sync.OnceValue(func() *pool {
-	return &pool{make(chan *instance, runtime.GOMAXPROCS(0))}
+	return &pool{max: runtime.GOMAXPROCS(0)}
 })
 
 // An instance holds an instance of the module, which is not safe for
 // concurrent use. Its methods panic if the module traps, which leaves it
 // unusable.
 type instance struct {
-	mod *shim.Module
+	mod   *shim.Module
+	trees treeCache
 }
 
 func (p *pool) acquire() *instance {
-	select {
-	case in := <-p.idle:
+	p.mu.Lock()
+	if n := len(p.idle); n > 0 {
+		in := p.idle[n-1]
+		p.idle[n-1] = nil
+		p.idle = p.idle[:n-1]
+		p.mu.Unlock()
 		return in
-	default:
-		return &instance{shim.New()}
 	}
+	p.mu.Unlock()
+	return &instance{mod: shim.New()}
 }
 
 // release returns in to the pool, unless it grew too large or the pool is
-// full.
+// full. Dropping an instance frees its trees with it.
 func (p *pool) release(in *instance) {
 	if len(in.memory()) > pooledLimit {
 		return
 	}
-	select {
-	case p.idle <- in:
-	default:
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.idle) < p.max {
+		p.idle = append(p.idle, in)
 	}
 }
 
@@ -78,19 +91,21 @@ func (in *instance) memory() []byte {
 	return *in.mod.Xmemory().Slice()
 }
 
-// parse parses src into a tree, which the caller must free with freeTree.
-func (in *instance) parse(src []byte) (tree int32, err error) {
+// parseTree parses src into a tree in the instance, which stays valid until
+// freeTree frees it, and returns the tree and the bytes it holds.
+func (in *instance) parseTree(src []byte) (tree int32, size int, err error) {
 	n := int32(len(src))
 	ptr := in.mod.Xalloc(n)
 	copy(in.memory()[uint32(ptr):], src)
 	tree = in.mod.Xparse(ptr, n)
 	in.mod.Xdealloc(ptr, n)
 	if tree == 0 {
-		return 0, in.parseError()
+		return 0, 0, in.parseError()
 	}
-	return tree, nil
+	return tree, int(uint32(in.mod.Xtree_size())), nil
 }
 
+// freeTree frees a tree that parseTree returned.
 func (in *instance) freeTree(tree int32) {
 	in.mod.Xtree_free(tree)
 }
@@ -108,8 +123,9 @@ func (in *instance) parseError() error {
 	return fmt.Errorf("XML syntax error: %s", in.memory()[ptr:ptr+n])
 }
 
-// render renders tree into dst, as Render does.
-func (in *instance) render(tree int32, w, h int, sx, sy, dx, dy float32, dst []byte) error {
+// renderTree renders a tree that parseTree returned into dst, as
+// [Doc.Render] describes.
+func (in *instance) renderTree(tree int32, w, h int, sx, sy, dx, dy float32, dst []byte) error {
 	ptr := in.mod.Xrender(tree, int32(w), int32(h), sx, sy, dx, dy)
 	if ptr == 0 {
 		return errors.New("out of memory")
@@ -117,33 +133,4 @@ func (in *instance) render(tree int32, w, h int, sx, sy, dx, dy float32, dst []b
 	copy(dst, in.memory()[uint32(ptr):])
 	in.mod.Xpixels_free(ptr, int32(w), int32(h))
 	return nil
-}
-
-// withTree parses src in the instance and calls f with the tree.
-func (in *instance) withTree(src []byte, f func(tree int32) error) error {
-	tree, err := in.parse(src)
-	if err != nil {
-		return err
-	}
-	err = f(tree)
-	in.freeTree(tree)
-	return err
-}
-
-// Parse reports whether resvg can parse the SVG document src.
-func Parse(src []byte) error {
-	return instances().run(func(in *instance) error {
-		return in.withTree(src, func(int32) error { return nil })
-	})
-}
-
-// Render renders the SVG document src into dst, a w×h image of
-// premultiplied RGBA, transformed by the matrix (sx 0 0 sy dx dy) from
-// the document's user space. On failure, dst is unchanged.
-func Render(src []byte, w, h int, sx, sy, dx, dy float32, dst []byte) error {
-	return instances().run(func(in *instance) error {
-		return in.withTree(src, func(tree int32) error {
-			return in.render(tree, w, h, sx, sy, dx, dy, dst)
-		})
-	})
 }
