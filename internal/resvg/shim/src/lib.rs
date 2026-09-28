@@ -82,6 +82,10 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: u32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn parse(ptr: *const u8, len: u32) -> *mut Tree {
     let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    if nesting(data) > MAX_DEPTH {
+        LAST_ERROR.with_borrow_mut(|e| *e = (5, String::new()));
+        return std::ptr::null_mut();
+    }
     let before = ALLOCATED.load(Relaxed);
     match Tree::from_data(data, &Options::default()) {
         Ok(tree) => {
@@ -105,6 +109,87 @@ pub unsafe extern "C" fn parse(ptr: *const u8, len: u32) -> *mut Tree {
             std::ptr::null_mut()
         }
     }
+}
+
+/// The deepest nesting of elements that parse accepts. roxmltree and resvg
+/// recurse on nesting, and deeper documents could overflow the stack, which
+/// traps. parse checks the bound that nesting returns against it.
+const MAX_DEPTH: usize = 256;
+
+/// Returns at least the depth to which roxmltree nests the elements of the
+/// XML document s, without recursing as roxmltree does. References expand
+/// entities, whose values may hold elements, up to 10 deep, so each level
+/// of the values counts 10 times. Where s is not well-formed, the result
+/// bounds only the part before the error.
+fn nesting(s: &[u8]) -> usize {
+    let find = |from: usize, pat: &[u8]| {
+        s[from..]
+            .windows(pat.len())
+            .position(|w| w == pat)
+            .map_or(s.len(), |n| from + n)
+    };
+    let (mut depth, mut max, mut entities) = (0usize, 0, 0);
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let rest = &s[i..];
+        if rest.starts_with(b"<!--") {
+            i = find(i + 4, b"-->") + 3;
+        } else if rest.starts_with(b"<![CDATA[") {
+            i = find(i + 9, b"]]>") + 3;
+        } else if rest.starts_with(b"<?") {
+            i = find(i + 2, b"?>") + 2;
+        } else if rest.starts_with(b"</") {
+            depth = depth.saturating_sub(1);
+            i += 2;
+        } else if rest.starts_with(b"<!DOCTYPE") {
+            // Skips the DTD, counting the elements in its literals, which
+            // cannot hold their own quote, so this recurses at most twice.
+            i += 9;
+            let mut subset = false;
+            while i < s.len() {
+                match s[i] {
+                    b'>' if !subset => break,
+                    b'[' => subset = true,
+                    b']' => break,
+                    q @ (b'"' | b'\'') => {
+                        let end = s[i + 1..]
+                            .iter()
+                            .position(|&c| c == q)
+                            .map_or(s.len(), |n| i + 1 + n);
+                        entities += nesting(&s[i + 1..end]);
+                        i = end;
+                    }
+                    b'<' if s[i..].starts_with(b"<!--") => i = find(i + 4, b"-->") + 2,
+                    b'<' if s[i..].starts_with(b"<?") => i = find(i + 2, b"?>") + 1,
+                    _ => {}
+                }
+                i += 1;
+            }
+        } else {
+            // A start tag, whose quoted attribute values may hold '>'.
+            let mut quote = None;
+            let mut j = i + 1;
+            while j < s.len() {
+                match (quote, s[j]) {
+                    (None, b'>') => break,
+                    (None, q @ (b'"' | b'\'')) => quote = Some(q),
+                    (Some(q), c) if c == q => quote = None,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if s[j - 1] != b'/' {
+                depth += 1;
+                max = max.max(depth);
+            }
+            i = j + 1;
+        }
+    }
+    max + 10 * entities
 }
 
 /// Returns the bytes that the tree parse last returned holds.
@@ -175,7 +260,8 @@ pub unsafe extern "C" fn pixels_free(ptr: *mut u8, w: u32, h: u32) {
 }
 
 /// Returns the kind of the last parse error: 1 for XML, 2 for an invalid
-/// size, 3 for too many elements, 4 for input that is not UTF-8.
+/// size, 3 for too many elements, 4 for input that is not UTF-8, 5 for
+/// elements nested too deeply.
 #[unsafe(no_mangle)]
 pub extern "C" fn error_code() -> u32 {
     LAST_ERROR.with_borrow(|e| e.0)
