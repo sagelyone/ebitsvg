@@ -138,49 +138,39 @@ across goroutines; an `Image` is not safe for concurrent use.
 
 ## SVG support
 
-Rendering uses a modified copy of [oksvg], drawn with [rasterx]. `Parse`
-reads UTF-8 or ASCII documents and supports paths and basic shapes; fills,
-with either fill rule, and strokes, including dashes, caps and joins; linear
-and radial gradients; opacity; transforms; lengths in user units or absolute
-units (px, in, cm, mm, pt and pc, at 96 px per inch); `<style>` rules for
-classes; `<use>` of elements in `<defs>`; and colors as names, `#rgb`,
-`#rgba`, `#rrggbb`, `#rrggbbaa`, `rgb()`, `rgba()`, `hsl()`, `hsla()` and
-`currentColor`, which is the `color` property, black unless the SVG sets it.
+Rendering uses [resvg], compiled to WebAssembly and translated to Go by
+[wasm2go], so ebitsvg needs no Rust, and the renderer no cgo. `Parse` reads
+UTF-8 or ASCII documents and renders static SVG 1.1 and the parts of SVG 2
+that resvg supports: shapes and paths, fills and strokes, gradients and
+patterns, clipping, masks, filters, markers, group opacity and blend modes,
+nested `<svg>` elements, `<symbol>`, `<switch>`, `<use>` of any element,
+`paint-order`, `vector-effect`, style sheets with CSS selectors, and lengths
+in any unit.
 
 Not supported:
 
-- text, images, `<symbol>`, `<marker>` and `<pattern>`, which are skipped;
-- `filter`, `clip-path` and `mask`, which are ignored: content is drawn
-  unfiltered and unclipped;
-- nested `<svg>` viewports, whose content is drawn in the parent's
-  coordinates;
-- `<switch>`, all of whose children are drawn;
-- `paint-order`, `mix-blend-mode` and `vector-effect`, which are ignored:
-  fills are drawn before strokes, blending is normal, and strokes scale with
-  transforms;
-- `<use>` of elements outside `<defs>`, or defined after the `<use>`, which
-  draws nothing;
-- opacity of an element or group as a whole: it applies to each fill and
-  stroke separately, so overlaps show through;
-- relative lengths (`%`, `em`, `ex`): on shapes they leave the shape
-  undrawn, in stroke widths, dashes and `<use>` x and y `Parse` rejects them,
-  and in gradients with `gradientUnits="userSpaceOnUse"`, percentages are
-  fractions of a user unit;
-- CSS selectors other than a class: a rule with `.a, rect` applies to class
-  `a` only, and selectors such as `rect`, `#id`, `.a.b` and `.a .b` match
-  nothing; class rules apply in the order of the `class` attribute rather
-  than the style sheet, rules in at-rules such as `@media` are ignored,
-  and values such as `var()` or `!important` are rejected.
+- text and `<image>` elements, which are skipped;
+- CSS Color 4 syntax, such as `rgb(0 0 0 / 50%)` or `hsl(240deg, 50%, 50%)`,
+  which is ignored like any invalid value;
+- `gradientTransform` inherited through a gradient's `href`: a gradient
+  without its own `gradientTransform` is untransformed, because of a resvg
+  bug.
 
-Stroke widths and dashes scale with transforms by the square root of their
-area scale factor, so they are exact under uniform scaling.
+As SVG specifies, invalid attribute and style values are ignored, as if they
+were absent, and a `<use>` element that references itself or an ancestor
+draws nothing.
 
 `Parse` rejects documents whose root element is not `<svg>`, that are
 compressed (.svgz) or encoded other than as UTF-8 or ASCII, whose size cannot
-be determined (see `SVG.Size`), that have unsupported style values, or whose
-`<use>` elements form a cycle or expand to an excessive amount of content. It
-reads all of its input: to parse untrusted input, limit its size with
-`io.LimitReader`.
+be determined (see `SVG.Size`), or that are not well-formed XML, which
+includes using entities other than XML's own and those the DOCTYPE declares,
+such as `&nbsp;`, and namespace prefixes such as `xlink:` that are not
+declared. It also rejects documents with too many elements, including those
+`<use>` elements copy, which a cycle of them makes unbounded. It reads all of
+its input: to parse untrusted input, limit its size with `io.LimitReader`.
+
+If rasterizing needs more memory than the renderer may use, 256 MiB, which a
+filter over a large raster can, the raster is transparent.
 
 To recolor an icon drawn in `currentColor`, replace that keyword with a color
 before parsing:
@@ -189,18 +179,42 @@ before parsing:
 src = regexp.MustCompile(`(?i)currentcolor`).ReplaceAll(src, []byte("tomato"))
 ```
 
+## Startup
+
+The renderer is Go code, compiled with your program, so it starts at once:
+the first `Parse` of an icon takes about 1 ms on a desktop computer. It is
+6.6 MB of generated source, which the first build compiles in about 6 s on a
+16-core desktop computer, using up to 2 GB of memory; later builds reuse it
+from Go's build cache.
+
 ## Testing
 
 Tests need a display. On headless Linux, run them with `xvfb-run -a go test
 ./...`. The reference images in `testdata` are rendered with `rsvg-convert`;
 the comment on `TestReference` in `svg_test.go` gives the command.
 
+`internal/resvg/internal/shim` is generated and committed, so that building
+ebitsvg needs no Rust. To regenerate it and
+`internal/resvg/THIRD_PARTY_NOTICES` after changing `internal/resvg/shim`,
+install [rustup], binaryen's `wasm-opt` and `cargo-about`, and run `go
+generate ./internal/resvg` with Go 1.26 or later, which wasm2go needs. The
+build is reproducible, and CI checks that the committed files match their
+sources. `go vet` and staticcheck report dead code in the generated package,
+so check the others:
+
+```sh
+go vet $(go list ./... | grep -v /internal/shim$)
+```
+
 ## License
 
-MIT. `internal/oksvg` is derived from [oksvg] and keeps its BSD 3-Clause
-license, in [internal/oksvg/LICENSE](internal/oksvg/LICENSE), so programs
-distributed in binary form must reproduce that notice too.
+MIT. `internal/resvg/internal/shim` is translated from resvg and other Rust
+crates under the MIT and BSD licenses, whose notices
+[internal/resvg/THIRD_PARTY_NOTICES](internal/resvg/THIRD_PARTY_NOTICES)
+reproduces, so programs distributed in binary form must reproduce those
+notices too.
 
 [Ebitengine]: https://ebitengine.org
-[oksvg]: https://github.com/srwiley/oksvg
-[rasterx]: https://github.com/srwiley/rasterx
+[resvg]: https://github.com/linebender/resvg
+[rustup]: https://rustup.rs
+[wasm2go]: https://github.com/ncruces/wasm2go
