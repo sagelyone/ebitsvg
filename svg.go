@@ -18,7 +18,7 @@ import (
 
 // SVG is a parsed SVG document. It is immutable and safe for concurrent use.
 type SVG struct {
-	src  []byte // with the root's width and height set to the size
+	doc  *resvg.Doc // of the source with the root's width and height set to the size
 	w, h float64
 }
 
@@ -47,10 +47,11 @@ func Parse(r io.Reader) (*SVG, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ebitsvg: %w", err)
 	}
-	if err := resvg.Parse(src); err != nil {
+	doc, err := resvg.Parse(src)
+	if err != nil {
 		return nil, fmt.Errorf("ebitsvg: %w", err)
 	}
-	return &SVG{src, w, h}, nil
+	return &SVG{doc, w, h}, nil
 }
 
 // Size returns the size of the SVG's viewBox or, if it has none, its width
@@ -81,6 +82,6 @@ func (s *SVG) rasterize(w, h int, sx, sy, dx, dy float64) *image.RGBA {
 	if w == 0 || h == 0 {
 		return img
 	}
-	resvg.Render(s.src, w, h, float32(sx), float32(sy), float32(dx), float32(dy), img.Pix)
+	s.doc.Render(w, h, float32(sx), float32(sy), float32(dx), float32(dy), img.Pix)
 	return img
 }

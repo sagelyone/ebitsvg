@@ -1,7 +1,9 @@
 //! A C ABI over resvg for ebitsvg, which runs it as WebAssembly. Pointers
 //! are offsets into linear memory, and a return value of 0 means failure.
 
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use resvg::tiny_skia::{PixmapMut, Transform};
 use resvg::usvg::{Error, Options, Tree, roxmltree};
@@ -9,6 +11,48 @@ use resvg::usvg::{Error, Options, Tree, roxmltree};
 thread_local! {
     static LAST_ERROR: RefCell<(u32, String)> = const { RefCell::new((0, String::new())) };
 }
+
+/// Counts the bytes allocated, so that parse can measure the trees it
+/// returns.
+struct Counting;
+
+static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+static TREE_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        if !ptr.is_null() {
+            ALLOCATED.fetch_add(layout.size(), Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        if !ptr.is_null() {
+            ALLOCATED.fetch_add(layout.size(), Relaxed);
+        }
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        ALLOCATED.fetch_sub(layout.size(), Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let new = unsafe { System.realloc(ptr, layout, new_size) };
+        if !new.is_null() {
+            ALLOCATED.fetch_add(new_size, Relaxed);
+            ALLOCATED.fetch_sub(layout.size(), Relaxed);
+        }
+        new
+    }
+}
+
+#[global_allocator]
+static GLOBAL: Counting = Counting;
 
 /// Allocates len bytes for the host to write into.
 #[unsafe(no_mangle)]
@@ -30,7 +74,7 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: u32) {
 }
 
 /// Parses the SVG document in len bytes at ptr into a tree, or returns 0
-/// and sets the last error.
+/// and sets the last error. tree_size then returns the size of the tree.
 ///
 /// # Safety
 ///
@@ -38,8 +82,13 @@ pub unsafe extern "C" fn dealloc(ptr: *mut u8, len: u32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn parse(ptr: *const u8, len: u32) -> *mut Tree {
     let data = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let before = ALLOCATED.load(Relaxed);
     match Tree::from_data(data, &Options::default()) {
-        Ok(tree) => Box::into_raw(Box::new(tree)),
+        Ok(tree) => {
+            let tree = Box::into_raw(Box::new(tree));
+            TREE_SIZE.store(ALLOCATED.load(Relaxed) - before, Relaxed);
+            tree
+        }
         Err(err) => {
             let (code, msg) = match err {
                 // usvg reports <use> expanding too deeply or to too many
@@ -56,6 +105,12 @@ pub unsafe extern "C" fn parse(ptr: *const u8, len: u32) -> *mut Tree {
             std::ptr::null_mut()
         }
     }
+}
+
+/// Returns the bytes that the tree parse last returned holds.
+#[unsafe(no_mangle)]
+pub extern "C" fn tree_size() -> u32 {
+    TREE_SIZE.load(Relaxed) as u32
 }
 
 /// Frees a tree that parse returned.
