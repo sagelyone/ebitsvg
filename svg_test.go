@@ -535,7 +535,24 @@ func TestPathSyntax(t *testing.T) {
 	}
 }
 
+// FuzzParse checks that Parse and Rasterize survive any input. resvg runs
+// as Go code, in which some failures, such as exhausting the goroutine
+// stack, crash the program rather than trap.
 func FuzzParse(f *testing.F) {
+	paths, err := filepath.Glob("testdata/*.svg")
+	if err != nil || len(paths) == 0 {
+		f.Fatalf("no SVGs: %v", err)
+	}
+	for _, path := range paths {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			f.Fatal(err)
+		}
+		// The fuzzer spends most of its time minimizing large inputs.
+		if len(src) <= 4<<10 {
+			f.Add(string(src))
+		}
+	}
 	f.Add(halves)
 	f.Add(line(`stroke-dasharray="1 2" stroke-dashoffset="3" transform="rotate(30 10 10) scale(2)"`))
 	f.Add(fanOut(3, 3))
