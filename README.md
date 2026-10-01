@@ -169,6 +169,12 @@ but not their opacity, clipping, masks or filters.
 In Inkscape, set a group's id in Object Properties. Illustrator and Figma
 export layer names as ids when their export settings ask them to.
 
+To watch a sprite sheet animation, a ball bouncing, run the example:
+
+```sh
+go run github.com/sagelyone/ebitsvg/examples/bounce@latest
+```
+
 ## How it works
 
 An `Image` first draws a raster made for exactly the pixels it covers, 1:1.
