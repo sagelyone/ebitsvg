@@ -379,8 +379,8 @@ func TestRasterizeFailure(t *testing.T) {
 	}
 }
 
-// sheet returns a 60×40 sprite sheet with the given content between blue
-// rectangles that cover the canvas, which sprites must not draw.
+// sheet returns a sprite sheet with the given viewBox and content, between
+// blue rectangles that cover the canvas, which sprites must not draw.
 func sheet(viewBox, content string) string {
 	const cover = `<rect x="-100" y="-100" width="300" height="300" fill="#00f"/>`
 	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="` + viewBox + `">` +
@@ -409,6 +409,18 @@ func TestSprite(t *testing.T) {
 		{"bounds after art",
 			sheet("0 0 60 40", `<g id="s">`+art+`<g><path d="M0 8H40" fill="none"/><rect x="8" y="8" width="24" height="16" fill="none"/></g></g>`),
 			`<svg viewBox="8 8 24 16">` + art + `</svg>`},
+		{"art beyond bounds",
+			sheet("0 0 60 40", `<g id="s"><rect x="14" y="14" width="12" height="12" fill="none"/>`+art+`</g>`),
+			`<svg viewBox="14 14 12 12">` + art + `</svg>`},
+		{"filter",
+			sheet("0 0 60 40", `<filter id="f"><feGaussianBlur stdDeviation="1"/></filter>
+				<g id="s" filter="url(#f)"><rect x="10" y="10" width="20" height="20" fill="none"/>`+art+`</g>`),
+			`<svg viewBox="10 10 20 20"><filter id="f"><feGaussianBlur stdDeviation="1"/></filter>
+				<g filter="url(#f)"><rect x="10" y="10" width="20" height="20" fill="none"/>` + art + `</g></svg>`},
+		{"duplicate id",
+			sheet("0 0 60 40", `<g id="s"><rect x="10" y="10" width="20" height="20" fill="none"/>`+art+`</g>
+				<g id="s"><rect x="30" width="30" height="40" fill="none"/><rect x="30" width="30" height="40" fill="#00f"/></g>`),
+			`<svg viewBox="10 10 20 20">` + art + `</svg>`},
 		{"transformed bounds",
 			sheet("0 0 60 40", `<g id="s"><rect width="20" height="20" fill="none" transform="translate(10 10)"/>`+art+`</g>`),
 			`<svg viewBox="10 10 20 20">` + art + `</svg>`},

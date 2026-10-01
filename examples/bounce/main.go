@@ -18,8 +18,8 @@ import (
 var ballSVG []byte
 
 // cycle is the order the frames play in: falling, squashing on the ground,
-// and rising again. The frames are evenly spaced in time, so the ball
-// speeds up as it falls.
+// and rising again. Each frame shows for the same time, and the ball moves
+// further between later frames, so it speeds up as it falls.
 var cycle = []int{0, 1, 2, 3, 4, 5, 4, 3, 2, 1}
 
 // ticksPerFrame plays the cycle in two-thirds of a second at 60 TPS.

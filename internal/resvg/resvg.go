@@ -154,8 +154,10 @@ func (in *instance) bounds(tree int32, id string) (b [4]float32, err error) {
 	idPtr, idLen := in.alloc([]byte(id))
 	out := in.mod.Xalloc(16)
 	code := in.mod.Xbounds(tree, idPtr, idLen, out)
-	for i := range b {
-		b[i] = math.Float32frombits(binary.LittleEndian.Uint32(in.memory()[uint32(out)+4*uint32(i):]))
+	if code == 0 {
+		for i := range b {
+			b[i] = math.Float32frombits(binary.LittleEndian.Uint32(in.memory()[uint32(out)+4*uint32(i):]))
+		}
 	}
 	in.mod.Xdealloc(out, 16)
 	in.mod.Xdealloc(idPtr, idLen)
