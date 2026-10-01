@@ -59,9 +59,10 @@ func (d *Doc) Render(id string, w, h int, sx, sy, dx, dy float32, dst []byte) er
 	})
 }
 
-// Bounds returns the bounds (x, y, w, h) in the document's user space of
-// the group with the given id: the bounding box of the first shape in the
-// group, in document order, that has an area and neither fill nor stroke.
+// Bounds returns the bounds (x, y, w, h) of the group with the given id,
+// in the coordinates that Render transforms: the axis-aligned bounding box
+// of the first shape in the group, in document order, that has an area and
+// neither fill nor stroke.
 func (d *Doc) Bounds(id string) (b [4]float32, err error) {
 	err = d.p.run(func(in *instance) error {
 		tree, err := in.tree(d)

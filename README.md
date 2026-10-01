@@ -160,8 +160,8 @@ Then draw the current frame from your game's `Draw` method, such as with
 
 The bounds rectangle draws nothing, so the sheet still draws as a whole,
 with each sprite in place. The first shape in the group, in document order,
-with neither fill nor stroke sets the bounds, whether that is set by
-attributes, `style` or a style sheet. A `<use>` element with an id is a
+that has an area and neither fill nor stroke sets the bounds, whether those
+are set by attributes, `style` or a style sheet. A `<use>` element with an id is a
 sprite too, which lets frames share art. The group's transform, opacity and
 effects apply, as do its ancestors' transforms, such as an Inkscape layer's,
 but not their opacity, clipping, masks or filters.

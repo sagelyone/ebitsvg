@@ -61,10 +61,11 @@ func Parse(r io.Reader) (*SVG, error) {
 }
 
 // Sprite returns an SVG of just the group with the given id, sized to the
-// group's bounds: those of its first shape, in document order, that has
-// neither fill nor stroke, normally a <rect fill="none">. The bounds set
-// the sprite's size and the padding around its art, and draw nothing, so a
-// sprite sheet, with a group for each sprite, also draws as a whole.
+// group's bounds: the axis-aligned bounding box, in the document, of its
+// first shape, in document order, that has an area and neither fill nor
+// stroke, normally a <rect fill="none">. The bounds set the sprite's size
+// and the padding around its art, and draw nothing, so a sprite sheet,
+// with a group for each sprite, also draws as a whole.
 //
 // The group is drawn with its own transform, opacity and effects, and with
 // its ancestors' transforms but not their opacity, clipping, masks or
