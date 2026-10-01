@@ -209,9 +209,10 @@ about 0.25 ms each, over 16 frames for the largest.
 The `Image`s of an `SVG` share the rasters they all need: sprites moving at
 the same size share one, as do still sprites at the same subpixel position,
 such as whole pixels. A new `Image` draws a raster that another has, if one
-suits it, and otherwise nothing until its own raster is ready, a few frames
-later. To show it at once, `Prepare` it until it is ready. Sharing goes
-through the same `*SVG`, so take each sprite from its sheet once.
+suits it, or else a blurry 64-pixel preview of the SVG, made when an `Image`
+of it is first drawn without a raster, until its own raster is ready a few
+frames later. To show it sharp at once, `Prepare` it until it is ready. Sharing goes through
+the same `*SVG`, so take each sprite from its sheet once.
 
 In browsers, Go runs every goroutine on one thread, so rasterizing still
 delays frames, by as long as it takes: about 250 ms for a 3000-pixel raster

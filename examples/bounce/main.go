@@ -43,9 +43,10 @@ func (g *game) Draw(screen *ebiten.Image) {
 	screen.Fill(color.RGBA{0xf4, 0xef, 0xe6, 0xff})
 	w, h := float64(screen.Bounds().Dx()), float64(screen.Bounds().Dy())
 	if !g.ready {
-		// An Image draws nothing until its first raster is ready, so each
-		// frame would flicker the first time it is shown. Until all are
-		// ready, which takes a few frames, only the background shows.
+		// An Image draws a blurry preview until its first raster is ready,
+		// so each frame would be blurry the first time it is shown. Until
+		// all are ready, which takes a few frames, only the background
+		// shows.
 		g.ready = true
 		for _, f := range g.frames {
 			// Prepare comes first, so that every frame starts rasterizing.
