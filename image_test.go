@@ -596,9 +596,10 @@ func TestDrawInBackground(t *testing.T) {
 	img := NewImage(s)
 	fill := color.RGBA{0, 0x88, 0xff, 0xff}
 
+	// The jobs make the SVG's preview and the exact raster.
 	draw(img, dst, 2, 3, 5, 40, 40, nil)
-	if got := held(img); got != "none" || len(bg.jobs) != 1 {
-		t.Fatalf("new: held %s, %d jobs; want none, 1", got, len(bg.jobs))
+	if got := held(img); got != "none" || len(bg.jobs) != 2 {
+		t.Fatalf("new: held %s, %d jobs; want none, 2", got, len(bg.jobs))
 	}
 	checkProbes(t, dst, []probe{{23, 25, empty}})
 	bg.run()
@@ -642,10 +643,11 @@ func TestPrepareInBackground(t *testing.T) {
 	s := mustParse(t, disc)
 	dst := ebiten.NewImage(64, 64)
 	img := NewImage(s)
+	// The jobs make the SVG's preview and the exact raster.
 	img.Draw(dst, 3, 5, 20, 20, nil)
 	img.job.state.Store(running)
-	if img.Prepare(3, 5, 40, 40, nil) || len(bg.jobs) != 1 {
-		t.Fatalf("while another job runs: Prepare = true or %d jobs; want false, 1", len(bg.jobs))
+	if img.Prepare(3, 5, 40, 40, nil) || len(bg.jobs) != 2 {
+		t.Fatalf("while another job runs: Prepare = true or %d jobs; want false, 2", len(bg.jobs))
 	}
 	img.job.state.Store(queued)
 	bg.run()
@@ -701,15 +703,15 @@ func TestShare(t *testing.T) {
 
 	draw(a, dst, 1, 3, 5, 40, 40, nil)
 	draw(b, dst, 1, 13, 4, 40, 40, nil)
-	if made != 1 || a.exact == nil || b.exact != a.exact || a.exact.refs != 2 {
-		t.Fatalf("made %d rasters, shared exact = %v; want 1, true", made, b.exact == a.exact)
+	if made != 2 || a.exact == nil || b.exact != a.exact || a.exact.refs != 2 {
+		t.Fatalf("made %d rasters, shared exact = %v; want 2 with the preview, true", made, b.exact == a.exact)
 	}
 	checkExact(t, dst, s, 13, 4, 40, 40)
 
 	draw(a, dst, 1, 3.5, 5, 30, 30, nil)
 	draw(b, dst, 1, 13.5, 4, 30, 30, nil)
-	if made != 2 || a.raster == nil || b.raster != a.raster || a.raster.refs != 2 {
-		t.Fatalf("moving: made %d rasters, shared 2x = %v; want 2, true", made, b.raster == a.raster)
+	if made != 3 || a.raster == nil || b.raster != a.raster || a.raster.refs != 2 {
+		t.Fatalf("moving: made %d rasters, shared 2x = %v; want 3, true", made, b.raster == a.raster)
 	}
 
 	*now += graceTicks
@@ -723,8 +725,8 @@ func TestShare(t *testing.T) {
 		t.Errorf("both settle: %d refs to the 2x raster, %d rasters, shared exact = %v; want 0, 1, true",
 			r.refs, len(s.cache.rasters), b.exact == a.exact)
 	}
-	if made != 3 {
-		t.Errorf("made %d rasters; want 3", made)
+	if made != 4 {
+		t.Errorf("made %d rasters; want 4", made)
 	}
 }
 
@@ -744,6 +746,42 @@ func TestDrawShared(t *testing.T) {
 		t.Fatalf("held %s, shared = %v, %d jobs; want 2x, true, 0", got, b.raster == a.raster, len(bg.jobs))
 	}
 	checkProbes(t, dst, []probe{{25, 23, color.RGBA{0, 0x88, 0xff, 0xff}}, {3, 3, empty}})
+}
+
+// TestPreview checks that a new Image draws the SVG's preview until it has
+// a raster.
+func TestPreview(t *testing.T) {
+	fakeTicks(t)
+	bg := inBackground(t)
+	s := mustParse(t, disc)
+	dst := ebiten.NewImage(256, 256)
+	if NewImage(mustParse(t, disc)).Prepare(0, 0, 256, 256, nil) || len(bg.jobs) != 1 {
+		t.Fatalf("Prepare started %d jobs; want 1, without the preview", len(bg.jobs))
+	}
+	bg.jobs = nil
+	img := NewImage(s)
+	draw(img, dst, 1, 0, 0, 256, 256, nil)
+	if len(bg.jobs) != 2 {
+		t.Fatalf("Draw started %d jobs; want 2, the preview first", len(bg.jobs))
+	}
+	if got := bg.jobs[0].args; got.w != previewSize+2*rasterMargin || got.h != got.w {
+		t.Errorf("preview is %d×%d; want %d with the margins", got.w, got.h, previewSize+2*rasterMargin)
+	}
+	draw(NewImage(s), dst, 1, 0, 0, 128, 128, nil)
+	if len(bg.jobs) != 3 {
+		t.Fatalf("another Image: %d jobs; want 3, without another preview", len(bg.jobs))
+	}
+	// Make the preview now, and later only img's raster.
+	bg.jobs[0].make(s)
+	bg.jobs = bg.jobs[1:2]
+	draw(img, dst, 1, 0, 0, 256, 256, nil)
+	if got := held(img); got != "none" {
+		t.Fatalf("held %s; want none", got)
+	}
+	checkProbes(t, dst, []probe{{128, 128, color.RGBA{0, 0x88, 0xff, 0xff}}, {2, 2, empty}})
+	bg.run()
+	draw(img, dst, 1, 0, 0, 256, 256, nil)
+	checkExact(t, dst, s, 0, 0, 256, 256)
 }
 
 // TestForget checks that the rasters of a dropped Image, which were never

@@ -45,6 +45,11 @@ const (
 	// raster, which takes over 10 ms at once, spreads over 16 frames.
 	uploadPixels = 1 << 20
 
+	// previewSize is the longer side, in pixels, of the preview that the
+	// Images of an SVG draw until they have a raster. It takes 1 to 10 ms
+	// to make and 20 KiB to hold.
+	previewSize = 64
+
 	// subpixels is the precision, per pixel, of exact positions. Rounding to
 	// it lets content moved by whole pixels keep its exact raster despite
 	// floating-point error.
@@ -105,8 +110,9 @@ type DrawOptions struct {
 //
 // The Images of an SVG share the rasters they all need, such as those of
 // sprites moving at the same size, and a new Image draws a raster that
-// another has, if one suits it. Images share only through the same *SVG,
-// so take each sprite from its sheet once.
+// another has, if one suits it, or else a blurry preview of the SVG, made
+// when an Image of it is first drawn without a raster. Images share only
+// through the same *SVG, so take each sprite from its sheet once.
 //
 // An Image caches for one target, so use one Image for each independently
 // drawn use of an SVG. An Image is not safe for concurrent use.
@@ -162,12 +168,13 @@ type raster struct {
 }
 
 // A cache holds the rasters that the Images of an SVG hold or are making,
-// so that they share them.
+// so that they share them, and the SVG's preview.
 type cache struct {
 	mu sync.Mutex
 	// rasters is weak so that the rasters of Images that are dropped
 	// without releasing them are collected.
 	rasters map[rasterArgs]weak.Pointer[raster]
+	preview *raster
 }
 
 // NewImage returns an Image that draws svg. It panics if svg is nil.
@@ -185,7 +192,8 @@ func NewImage(svg *SVG) *Image {
 // nothing. Draw panics if opts.Fit is not a valid [Fit].
 //
 // Draw does not rasterize: it starts making the raster it needs in the
-// background and meanwhile draws the closest raster it has, if any.
+// background and meanwhile draws the closest raster it has, or else the
+// SVG's preview, once that is ready.
 //
 // Sharpness is measured in pixels of dst, so dst must reach the screen
 // unscaled; for high-DPI displays, have LayoutF return device pixels
@@ -212,7 +220,11 @@ func (img *Image) Draw(dst *ebiten.Image, x, y, w, h float64, opts *DrawOptions)
 		dst.DrawImage(img.exact.img, op)
 		return
 	}
-	if r := cmp.Or(img.raster, img.exact); r != nil {
+	r := cmp.Or(img.raster, img.exact)
+	if r == nil {
+		r = img.svg.cache.readyPreview()
+	}
+	if r != nil {
 		r.draw(dst, p, op)
 	}
 }
@@ -286,7 +298,7 @@ func (img *Image) Prepare(x, y, w, h float64, opts *DrawOptions) bool {
 func (img *Image) update(p placement, prepare bool) (px, py float64, exact bool) {
 	img.collect()
 	if img.raster == nil && img.exact == nil {
-		img.adopt(p)
+		img.adopt(p, prepare)
 	}
 	j := img.job
 	t, px, py, exact := p.exact()
@@ -372,14 +384,28 @@ func (img *Image) retire(now int64) {
 }
 
 // adopt makes a ready raster of the SVG that suits p img's raster, so that
-// a new Image draws one that another Image has at once.
-func (img *Image) adopt(p placement) {
+// a new Image draws one that another Image has at once. Failing that, unless
+// preparing, it starts making the SVG's preview, ahead of img's raster.
+func (img *Image) adopt(p placement, prepare bool) {
 	c := &img.svg.cache
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if r := c.suiting(p); r != nil && r.ready() {
 		r.refs++
 		img.raster, img.anchorX, img.anchorY = r, r.anchorX, r.anchorY
+		return
+	}
+	if !prepare && c.preview == nil {
+		sw, sh := img.svg.Size()
+		k := previewSize / 2 / max(sw, sh)
+		c.preview = &raster{
+			args:    twice(sw, sh, k, k),
+			margin:  rasterMargin,
+			anchorX: k,
+			anchorY: k,
+			done:    make(chan struct{}),
+		}
+		start(img.svg, c.preview)
 	}
 }
 
@@ -565,6 +591,17 @@ func (c *cache) suiting(p placement) *raster {
 		}
 	}
 	return best
+}
+
+// readyPreview returns the SVG's preview once it is ready, uploading it
+// first.
+func (c *cache) readyPreview() *raster {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p := c.preview; p.finished() && p.upload() {
+		return p
+	}
+	return nil
 }
 
 const (
