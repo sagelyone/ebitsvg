@@ -8,8 +8,10 @@
 package resvg
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"runtime"
 	"sync"
 
@@ -94,15 +96,22 @@ func (in *instance) memory() []byte {
 // parseTree parses src into a tree in the instance, which stays valid until
 // freeTree frees it, and returns the tree and the bytes it holds.
 func (in *instance) parseTree(src []byte) (tree int32, size int, err error) {
-	n := int32(len(src))
-	ptr := in.mod.Xalloc(n)
-	copy(in.memory()[uint32(ptr):], src)
+	ptr, n := in.alloc(src)
 	tree = in.mod.Xparse(ptr, n)
 	in.mod.Xdealloc(ptr, n)
 	if tree == 0 {
 		return 0, 0, in.parseError()
 	}
 	return tree, int(uint32(in.mod.Xtree_size())), nil
+}
+
+// alloc copies b into linear memory, where the caller must free it with
+// Xdealloc(ptr, n).
+func (in *instance) alloc(b []byte) (ptr, n int32) {
+	n = int32(len(b))
+	ptr = in.mod.Xalloc(n)
+	copy(in.memory()[uint32(ptr):], b)
+	return ptr, n
 }
 
 // freeTree frees a tree that parseTree returned.
@@ -127,12 +136,34 @@ func (in *instance) parseError() error {
 
 // renderTree renders a tree that parseTree returned into dst, as
 // [Doc.Render] describes.
-func (in *instance) renderTree(tree int32, w, h int, sx, sy, dx, dy float32, dst []byte) error {
-	ptr := in.mod.Xrender(tree, int32(w), int32(h), sx, sy, dx, dy)
+func (in *instance) renderTree(tree int32, id string, w, h int, sx, sy, dx, dy float32, dst []byte) error {
+	idPtr, idLen := in.alloc([]byte(id))
+	ptr := in.mod.Xrender(tree, idPtr, idLen, int32(w), int32(h), sx, sy, dx, dy)
+	in.mod.Xdealloc(idPtr, idLen)
 	if ptr == 0 {
 		return errors.New("out of memory")
 	}
 	copy(dst, in.memory()[uint32(ptr):])
 	in.mod.Xpixels_free(ptr, int32(w), int32(h))
 	return nil
+}
+
+// bounds returns the bounds of a group in a tree that parseTree returned,
+// as [Doc.Bounds] describes.
+func (in *instance) bounds(tree int32, id string) (b [4]float32, err error) {
+	idPtr, idLen := in.alloc([]byte(id))
+	out := in.mod.Xalloc(16)
+	code := in.mod.Xbounds(tree, idPtr, idLen, out)
+	for i := range b {
+		b[i] = math.Float32frombits(binary.LittleEndian.Uint32(in.memory()[uint32(out)+4*uint32(i):]))
+	}
+	in.mod.Xdealloc(out, 16)
+	in.mod.Xdealloc(idPtr, idLen)
+	switch code {
+	case 1:
+		return b, fmt.Errorf("no group with id %q", id)
+	case 2:
+		return b, fmt.Errorf("group %q has no bounds: add a <rect> with no fill or stroke", id)
+	}
+	return b, nil
 }

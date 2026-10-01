@@ -46,7 +46,7 @@ func fill(rrggbb string, n int) []byte {
 func checkFill(t testing.TB, d *Doc, rrggbb string) {
 	t.Helper()
 	dst := make([]byte, 4)
-	if err := d.Render(1, 1, 1, 1, 0, 0, dst); err != nil {
+	if err := d.Render("", 1, 1, 1, 1, 0, 0, dst); err != nil {
 		t.Error(err)
 	} else if got := fmt.Sprintf("%02x%02x%02x%02x", dst[0], dst[1], dst[2], dst[3]); got != rrggbb+"ff" {
 		t.Errorf("pixel = #%s; want #%sff", got, rrggbb)
@@ -76,7 +76,7 @@ func TestPool(t *testing.T) {
 		for range 2 * p.max {
 			wg.Go(func() {
 				dst := make([]byte, size*size*4)
-				if err := d.Render(size, size, float32(size), float32(size), 0, 0, dst); err != nil {
+				if err := d.Render("", size, size, float32(size), float32(size), 0, 0, dst); err != nil {
 					t.Error(err)
 				} else if dst[len(dst)-4] != 0xff || dst[len(dst)-1] != 0xff {
 					t.Errorf("%d×%d: last pixel = %v; want red", size, size, dst[len(dst)-4:])
@@ -264,7 +264,7 @@ func TestPixels(t *testing.T) {
 			t.Fatalf("%s: %v", path, err)
 		}
 		dst := make([]byte, size*size*4)
-		if err := d.Render(size, size, 1, 1, 0, 0, dst); err != nil {
+		if err := d.Render("", size, size, 1, 1, 0, 0, dst); err != nil {
 			t.Fatalf("%s: %v", path, err)
 		}
 		fmt.Fprintf(&got, "%x  %s\n", sha256.Sum256(dst), filepath.Base(path))

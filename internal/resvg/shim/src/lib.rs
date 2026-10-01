@@ -5,8 +5,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-use resvg::tiny_skia::{PixmapMut, Transform};
-use resvg::usvg::{Error, Options, Tree, roxmltree};
+use resvg::tiny_skia::{NonZeroRect, PixmapMut, Transform};
+use resvg::usvg::{Error, Group, Node, Options, Tree, roxmltree};
 
 thread_local! {
     static LAST_ERROR: RefCell<(u32, String)> = const { RefCell::new((0, String::new())) };
@@ -209,15 +209,20 @@ pub unsafe extern "C" fn tree_free(tree: *mut Tree) {
 }
 
 /// Renders a tree into a new w×h pixmap of premultiplied RGBA, transformed
-/// by the matrix (sx 0 0 sy dx dy). It returns the pixmap's w*h*4 bytes, or
-/// 0 if they cannot be allocated.
+/// by the matrix (sx 0 0 sy dx dy). If the id in id_len bytes at id_ptr is
+/// not empty, it renders only the group with that id, as transformed in the
+/// tree, and nothing if there is none. It returns the pixmap's w*h*4 bytes,
+/// or 0 if they cannot be allocated.
 ///
 /// # Safety
 ///
-/// tree must be from parse, and not freed yet.
+/// tree must be from parse, and not freed yet, and id_ptr must point to
+/// id_len readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn render(
     tree: *const Tree,
+    id_ptr: *const u8,
+    id_len: u32,
     w: u32,
     h: u32,
     sx: f32,
@@ -226,6 +231,7 @@ pub unsafe extern "C" fn render(
     dy: f32,
 ) -> *mut u8 {
     let tree = unsafe { &*tree };
+    let id = unsafe { std::slice::from_raw_parts(id_ptr, id_len as usize) };
     let Some(len) = (w as usize)
         .checked_mul(h as usize)
         .and_then(|n| n.checked_mul(4))
@@ -240,12 +246,74 @@ pub unsafe extern "C" fn render(
     let Some(mut pixmap) = PixmapMut::from_bytes(&mut data, w, h) else {
         return std::ptr::null_mut();
     };
-    resvg::render(
-        tree,
-        Transform::from_row(sx, 0.0, 0.0, sy, dx, dy),
-        &mut pixmap,
-    );
+    let transform = Transform::from_row(sx, 0.0, 0.0, sy, dx, dy);
+    if id.is_empty() {
+        resvg::render(tree, transform, &mut pixmap);
+    } else if let Some((node, parent)) = find_group(tree.root(), id)
+        && let Some(layer) = node.abs_layer_bounding_box()
+    {
+        // render_node applies the node's own transform but not its
+        // ancestors', and shifts the node by minus its layer's position.
+        let transform = transform
+            .pre_concat(parent.abs_transform())
+            .pre_translate(layer.x(), layer.y());
+        resvg::render_node(node, transform, &mut pixmap);
+    }
     Box::into_raw(data.into_boxed_slice()).cast()
+}
+
+/// Writes to out the bounds (x, y, width, height), in canvas coordinates,
+/// of the group in tree with the id in id_len bytes at id_ptr: those of the
+/// first path in the group, in document order, that has an area and
+/// neither fill nor stroke. It returns 0, or 1 if there is no group with
+/// that id, or 2 if the group has no such path.
+///
+/// # Safety
+///
+/// tree must be from parse, and not freed yet, id_ptr must point to id_len
+/// readable bytes, and out to 16 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn bounds(
+    tree: *const Tree,
+    id_ptr: *const u8,
+    id_len: u32,
+    out: *mut [f32; 4],
+) -> u32 {
+    let tree = unsafe { &*tree };
+    let id = unsafe { std::slice::from_raw_parts(id_ptr, id_len as usize) };
+    if id.is_empty() {
+        return 1;
+    }
+    let Some((Node::Group(group), _)) = find_group(tree.root(), id) else {
+        return 1;
+    };
+    let Some(r) = invisible_bounds(group) else {
+        return 2;
+    };
+    unsafe { out.write_unaligned([r.x(), r.y(), r.width(), r.height()]) };
+    0
+}
+
+/// Returns the first group within parent, in document order, with the id,
+/// and the group's parent.
+fn find_group<'a>(parent: &'a Group, id: &[u8]) -> Option<(&'a Node, &'a Group)> {
+    parent.children().iter().find_map(|node| match node {
+        Node::Group(g) if g.id().as_bytes() == id => Some((node, parent)),
+        Node::Group(g) => find_group(g, id),
+        _ => None,
+    })
+}
+
+/// Returns the canvas bounding box of the first path within group, in
+/// document order, that has an area and neither fill nor stroke.
+fn invisible_bounds(group: &Group) -> Option<NonZeroRect> {
+    group.children().iter().find_map(|node| match node {
+        Node::Group(g) => invisible_bounds(g),
+        Node::Path(p) if p.fill().is_none() && p.stroke().is_none() => {
+            p.abs_bounding_box().to_non_zero_rect()
+        }
+        _ => None,
+    })
 }
 
 /// Frees the pixels of a w×h pixmap that render returned.

@@ -6,6 +6,8 @@
 // size or position changes, it draws a raster made at twice the displayed
 // size, reused until that size halves or doubles. Once they settle, it draws a
 // raster made for exactly the pixels it covers.
+//
+// [SVG.Sprite] takes the sprites out of a sprite sheet, as SVGs of their own.
 package ebitsvg
 
 import (
@@ -16,9 +18,12 @@ import (
 	"github.com/sagelyone/ebitsvg/internal/resvg"
 )
 
-// SVG is a parsed SVG document. It is immutable and safe for concurrent use.
+// SVG is a parsed SVG document, or a sprite in one (see [SVG.Sprite]). It
+// is immutable and safe for concurrent use.
 type SVG struct {
-	doc  *resvg.Doc // of the source with the root's width and height set to the size
+	doc  *resvg.Doc // of the source with the root's width and height set to its size
+	id   string     // of a sprite's group, or empty for the whole document
+	x, y float64    // the origin of a sprite's bounds in the document
 	w, h float64
 }
 
@@ -52,14 +57,40 @@ func Parse(r io.Reader) (*SVG, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ebitsvg: %w", err)
 	}
-	return &SVG{doc, w, h}, nil
+	return &SVG{doc: doc, w: w, h: h}, nil
+}
+
+// Sprite returns an SVG of just the group with the given id, sized to the
+// group's bounds: those of its first shape, in document order, that has
+// neither fill nor stroke, normally a <rect fill="none">. The bounds set
+// the sprite's size and the padding around its art, and draw nothing, so a
+// sprite sheet, with a group for each sprite, also draws as a whole.
+//
+// The group is drawn with its own transform, opacity and effects, and with
+// its ancestors' transforms but not their opacity, clipping, masks or
+// filters. If several groups have the id, Sprite uses the first in
+// document order. s can be the whole document or any sprite in it.
+func (s *SVG) Sprite(id string) (*SVG, error) {
+	b, err := s.doc.Bounds(id)
+	if err != nil {
+		return nil, fmt.Errorf("ebitsvg: %w", err)
+	}
+	return &SVG{
+		doc: s.doc,
+		id:  id,
+		x:   float64(b[0]),
+		y:   float64(b[1]),
+		w:   float64(b[2]),
+		h:   float64(b[3]),
+	}, nil
 }
 
 // Size returns the size of the SVG's viewBox or, if it has none, its width
 // and height, which must then be in absolute units, converted to px. It is
 // the size of the coordinate system the SVG is drawn in, which gives its
 // aspect ratio, and not necessarily the size a browser displays, which width
-// and height set: Material Symbols, for example, report 960×960.
+// and height set: Material Symbols, for example, report 960×960. A
+// sprite's size is that of its bounds, in the document's units.
 func (s *SVG) Size() (w, h float64) {
 	return s.w, s.h
 }
@@ -83,6 +114,6 @@ func (s *SVG) rasterize(w, h int, sx, sy, dx, dy float64) *image.RGBA {
 	if w == 0 || h == 0 {
 		return img
 	}
-	s.doc.Render(w, h, float32(sx), float32(sy), float32(dx), float32(dy), img.Pix)
+	s.doc.Render(s.id, w, h, float32(sx), float32(sy), float32(dx-s.x*sx), float32(dy-s.y*sy), img.Pix)
 	return img
 }
