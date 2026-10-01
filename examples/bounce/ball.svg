@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 240">
+	<!-- A sprite sheet of a ball bouncing. Each frame is a group with an id,
+	     and its rectangle without fill or stroke sets the frame's 120×240
+	     cell. The frames use one ball, defined once, squashed and
+	     stretched near the ground. -->
+	<defs>
+		<radialGradient id="shine" cx="0.38" cy="0.32" r="0.75">
+			<stop offset="0" stop-color="#ff8a80"/>
+			<stop offset="0.45" stop-color="#e01b24"/>
+			<stop offset="1" stop-color="#5c0a10"/>
+		</radialGradient>
+		<filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+			<feGaussianBlur stdDeviation="1.5"/>
+		</filter>
+		<filter id="blur" x="-50%" y="-200%" width="200%" height="500%">
+			<feGaussianBlur stdDeviation="3"/>
+		</filter>
+		<g id="ball">
+			<circle r="30" fill="url(#shine)"/>
+			<ellipse cx="-11" cy="-13" rx="10" ry="6" fill="#fff" opacity="0.85"
+				transform="rotate(-35 -11 -13)" filter="url(#soft)"/>
+		</g>
+	</defs>
+	<g id="bounce-0">
+		<rect width="120" height="240" fill="none"/>
+		<ellipse cx="60" cy="222" rx="16" ry="5" opacity="0.12" filter="url(#blur)"/>
+		<use href="#ball" transform="translate(60 50)"/>
+	</g>
+	<g id="bounce-1">
+		<rect x="120" width="120" height="240" fill="none"/>
+		<ellipse cx="180" cy="222" rx="17" ry="5" opacity="0.13" filter="url(#blur)"/>
+		<use href="#ball" transform="translate(180 58.75)"/>
+	</g>
+	<g id="bounce-2">
+		<rect x="240" width="120" height="240" fill="none"/>
+		<ellipse cx="300" cy="222" rx="20.5" ry="5" opacity="0.18" filter="url(#blur)"/>
+		<use href="#ball" transform="translate(300 85)"/>
+	</g>
+	<g id="bounce-3">
+		<rect x="360" width="120" height="240" fill="none"/>
+		<ellipse cx="420" cy="222" rx="26" ry="5" opacity="0.25" filter="url(#blur)"/>
+		<use href="#ball" transform="translate(420 128.75) scale(0.97 1.04)"/>
+	</g>
+	<g id="bounce-4">
+		<rect x="480" width="120" height="240" fill="none"/>
+		<ellipse cx="540" cy="222" rx="34" ry="5" opacity="0.35" filter="url(#blur)"/>
+		<use href="#ball" transform="translate(540 187) scale(0.92 1.1)"/>
+	</g>
+	<g id="bounce-5">
+		<rect x="600" width="120" height="240" fill="none"/>
+		<ellipse cx="660" cy="222" rx="38" ry="5" opacity="0.38" filter="url(#blur)"/>
+		<use href="#ball" transform="translate(660 197.5) scale(1.25 0.75)"/>
+	</g>
+</svg>
