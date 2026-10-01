@@ -29,8 +29,9 @@ type game struct {
 	// Each frame gets its own Image, which keeps a raster for it, so once
 	// every frame has been shown, the animation rasterizes nothing until
 	// the window size changes.
-	frames []*ebitsvg.Image
-	ticks  int
+	frames   []*ebitsvg.Image
+	prepared bool
+	ticks    int
 }
 
 func (g *game) Update() error {
@@ -40,9 +41,17 @@ func (g *game) Update() error {
 
 func (g *game) Draw(screen *ebiten.Image) {
 	screen.Fill(color.RGBA{0xf4, 0xef, 0xe6, 0xff})
-	b := screen.Bounds()
+	w, h := float64(screen.Bounds().Dx()), float64(screen.Bounds().Dy())
+	if !g.prepared {
+		// An Image draws nothing until its first raster is ready, so each
+		// frame would flicker the first time it is shown.
+		for _, f := range g.frames {
+			f.Prepare(0, 0, w, h, nil)
+		}
+		g.prepared = true
+	}
 	frame := cycle[g.ticks/ticksPerFrame%len(cycle)]
-	g.frames[frame].Draw(screen, 0, 0, float64(b.Dx()), float64(b.Dy()), nil)
+	g.frames[frame].Draw(screen, 0, 0, w, h, nil)
 }
 
 // LayoutF returns the window size in whole device pixels, so that the ball

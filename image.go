@@ -1,9 +1,12 @@
 package ebitsvg
 
 import (
+	"cmp"
 	"fmt"
 	"image"
 	"math"
+	"runtime"
+	"sync/atomic"
 
 	"github.com/hajimehoshi/ebiten/v2"
 )
@@ -76,7 +79,8 @@ type DrawOptions struct {
 	Blend      ebiten.Blend
 }
 
-// Image draws an SVG through cached rasters.
+// Image draws an SVG through cached rasters, which it makes in the
+// background, so that drawing never waits for rasterizing.
 //
 // An Image first draws a raster made for exactly its target, pixel for
 // pixel. While the target changes, it draws from a raster made at twice the
@@ -87,6 +91,11 @@ type DrawOptions struct {
 // meanwhile waits those 60 ticks for an exact raster, so content moving in
 // steps reuses its rasters and a still Image ends up holding one.
 //
+// Until the raster it needs is ready, an Image draws the closest one it
+// has, scaled, and a new Image draws nothing; [Image.Prepare] makes rasters
+// ahead of time. An Image makes one raster at a time, and Images make at
+// most GOMAXPROCS-1 at once, leaving the game a CPU.
+//
 // An Image caches for one target, so use one Image for each independently
 // drawn use of an SVG. An Image is not safe for concurrent use.
 type Image struct {
@@ -94,26 +103,37 @@ type Image struct {
 
 	// raster was made at twice the display scale (anchorX, anchorY), with
 	// rasterMargin texels around the SVG.
-	raster           *ebiten.Image
+	raster           *raster
 	anchorX, anchorY float64
 
-	// exact, if not nil, is made for target, which Draw has had since tick
-	// since. restless is whether the target changed within graceTicks of
-	// settling.
-	exact    *ebiten.Image
-	target   exactTarget
+	// exact is made for target, which Draw has had since tick since, if
+	// its args are target, and otherwise for an earlier target. restless
+	// is whether the target changed within graceTicks of settling.
+	exact    *raster
+	target   rasterArgs
 	since    int64
 	restless bool
+
+	// job, if not nil, makes a raster in the background.
+	job *job
 }
 
 // tick is [ebiten.Tick], replaced by tests, which run within one tick.
 var tick = ebiten.Tick
 
-// exactTarget is the rasterize arguments of a raster that maps pixel for
-// pixel onto the destination.
-type exactTarget struct {
+// rasterArgs are the arguments of [SVG.rasterize]: a w×h raster with the
+// SVG's point (u, v) at texel (u*sx + dx, v*sy + dy).
+type rasterArgs struct {
 	w, h           int
 	sx, sy, dx, dy float64
+}
+
+// A raster is an SVG rasterized with args, with margin transparent texels
+// around the SVG's bounds.
+type raster struct {
+	img    *ebiten.Image
+	args   rasterArgs
+	margin int
 }
 
 // NewImage returns an Image that draws svg. It panics if svg is nil.
@@ -130,6 +150,9 @@ func NewImage(svg *SVG) *Image {
 // sub-image are its parent's. A box without a positive, finite size draws
 // nothing. Draw panics if opts.Fit is not a valid [Fit].
 //
+// Draw does not rasterize: it starts making the raster it needs in the
+// background and meanwhile draws the closest raster it has, if any.
+//
 // Sharpness is measured in pixels of dst, so dst must reach the screen
 // unscaled; for high-DPI displays, have LayoutF return device pixels
 // (see the package example).
@@ -144,14 +167,11 @@ func (img *Image) Draw(dst *ebiten.Image, x, y, w, h float64, opts *DrawOptions)
 	if !ok {
 		return
 	}
-	op := &ebiten.DrawImageOptions{
-		ColorScale: opts.ColorScale,
-		Blend:      opts.Blend,
-		Filter:     ebiten.FilterLinear,
-	}
-	if t, px, py, ok := p.exact(); ok {
-		fresh := img.raster == nil && img.exact == nil
-		now := tick()
+	img.collect()
+	t, px, py, exact := p.exact()
+	var now int64
+	if exact {
+		now = tick()
 		if t != img.target {
 			img.setTarget(t, now)
 		}
@@ -159,29 +179,49 @@ func (img *Image) Draw(dst *ebiten.Image, x, y, w, h float64, opts *DrawOptions)
 		if img.restless {
 			wait = graceTicks
 		}
-		if fresh || img.exact != nil || now-img.since >= wait {
-			img.settle(now)
-			op.GeoM.Translate(px, py)
-			dst.DrawImage(img.exact, op)
-			return
+		if img.exact == nil && img.raster == nil || img.exactNow() || now-img.since >= wait {
+			img.settle()
+		} else {
+			img.wantRaster(p)
 		}
 	} else {
-		img.setTarget(exactTarget{}, 0)
+		img.setTarget(rasterArgs{}, 0)
+		img.wantRaster(p)
+	}
+	img.collect() // in case start ran the job at once, as tests make it
+	if exact {
+		img.retire(now)
 	}
 
-	img.makeRaster(p)
-	src, b := img.raster, img.raster.Bounds()
-	const m = rasterMargin
-	rx, ry := p.sx*p.sw/float64(b.Dx()-2*m), p.sy*p.sh/float64(b.Dy()-2*m)
+	op := &ebiten.DrawImageOptions{
+		ColorScale: opts.ColorScale,
+		Blend:      opts.Blend,
+		Filter:     ebiten.FilterLinear,
+	}
+	if exact && img.exactNow() {
+		op.GeoM.Translate(px, py)
+		dst.DrawImage(img.exact.img, op)
+		return
+	}
+	if r := cmp.Or(img.raster, img.exact); r != nil {
+		r.draw(dst, p, op)
+	}
+}
+
+// draw draws r, scaled to where p places the SVG.
+func (r *raster) draw(dst *ebiten.Image, p placement, op *ebiten.DrawImageOptions) {
+	src, b := r.img, r.img.Bounds()
+	a := r.args
+	rx, ry := p.sx/a.sx, p.sy/a.sy
 	if p.fit == Cover {
 		// Clipping the source, unlike a sub-image of dst, follows any GeoM.
 		b = image.Rect(
-			rasterEdge((p.x-p.ox)/rx+m, b.Dx()), rasterEdge((p.y-p.oy)/ry+m, b.Dy()),
-			rasterEdge((p.x+p.w-p.ox)/rx+m, b.Dx()), rasterEdge((p.y+p.h-p.oy)/ry+m, b.Dy()),
+			rasterEdge((p.x-p.ox)/rx+a.dx, b.Dx()), rasterEdge((p.y-p.oy)/ry+a.dy, b.Dy()),
+			rasterEdge((p.x+p.w-p.ox)/rx+a.dx, b.Dx()), rasterEdge((p.y+p.h-p.oy)/ry+a.dy, b.Dy()),
 		)
 	}
-	if !keepsDst(opts.Blend) {
-		b = b.Intersect(src.Bounds().Inset(m))
+	if !keepsDst(op.Blend) {
+		b = b.Intersect(src.Bounds().Inset(r.margin))
 	}
 	if b != src.Bounds() {
 		if b.Empty() {
@@ -190,8 +230,8 @@ func (img *Image) Draw(dst *ebiten.Image, x, y, w, h float64, opts *DrawOptions)
 		src = src.SubImage(b).(*ebiten.Image)
 	}
 	op.GeoM.Scale(rx, ry)
-	op.GeoM.Translate(p.ox+float64(b.Min.X-m)*rx, p.oy+float64(b.Min.Y-m)*ry)
-	op.GeoM.Concat(opts.GeoM)
+	op.GeoM.Translate(p.ox+(float64(b.Min.X)-a.dx)*rx, p.oy+(float64(b.Min.Y)-a.dy)*ry)
+	op.GeoM.Concat(p.geoM)
 	dst.DrawImage(src, op)
 }
 
@@ -212,8 +252,8 @@ func keepsDst(b ebiten.Blend) bool {
 }
 
 // Prepare rasterizes now what [Image.Draw] settles on for the same
-// arguments, so that drawing them needs no rasterization. Use it to render
-// ahead of time, such as behind a loading screen.
+// arguments, so that drawing them needs no rasterization and draws them at
+// once. Use it to render ahead of time, such as behind a loading screen.
 func (img *Image) Prepare(x, y, w, h float64, opts *DrawOptions) {
 	if opts == nil {
 		opts = &DrawOptions{}
@@ -222,66 +262,142 @@ func (img *Image) Prepare(x, y, w, h float64, opts *DrawOptions) {
 	if !ok {
 		return
 	}
-	t, _, _, ok := p.exact()
-	if !ok {
-		img.makeRaster(p)
-		return
-	}
+	t, _, _, exact := p.exact()
 	now := tick()
-	if t != img.target {
-		img.setTarget(t, now)
+	for {
+		if exact {
+			if t != img.target {
+				img.setTarget(t, now)
+			}
+			img.settle()
+		} else {
+			img.wantRaster(p)
+		}
+		// The job may have been making another raster.
+		j := img.job
+		if j == nil {
+			break
+		}
+		<-j.done
+		img.collect()
 	}
-	img.settle(now)
+	if exact {
+		img.retire(now)
+	}
 }
 
-// setTarget sets the exact target, first seen at tick since, releasing an
-// exact raster made for another target.
-func (img *Image) setTarget(t exactTarget, since int64) {
-	if t != img.target && img.exact != nil {
-		img.exact.Deallocate()
-		img.exact = nil
-		img.restless = img.raster != nil
+// exactNow reports whether img.exact is made for img.target.
+func (img *Image) exactNow() bool {
+	return img.exact != nil && img.exact.args == img.target
+}
+
+// setTarget sets the exact target, first seen at tick since.
+func (img *Image) setTarget(t rasterArgs, since int64) {
+	if t != img.target {
+		if img.exactNow() {
+			img.restless = img.raster != nil
+		}
+		if j := img.job; j != nil && j.exact {
+			j.cancel()
+		}
 	}
 	img.target, img.since = t, since
 }
 
-// settle ensures that img.exact is made for img.target, and releases the
-// raster once the target has persisted for graceTicks at tick now.
-func (img *Image) settle(now int64) {
-	if img.exact == nil {
-		t := img.target
-		img.exact = ebiten.NewImageFromImage(img.svg.rasterize(t.w, t.h, t.sx, t.sy, t.dx, t.dy))
+// settle starts making the exact raster for img.target, unless img has it.
+func (img *Image) settle() {
+	if !img.exactNow() {
+		img.request(&job{args: img.target, exact: true})
 	}
-	if img.raster != nil && now-img.since >= graceTicks {
-		img.raster.Deallocate()
+}
+
+// retire releases the raster for a changing target once img has the exact
+// raster and the target has persisted for graceTicks at tick now.
+func (img *Image) retire(now int64) {
+	if img.exactNow() && img.raster != nil && now-img.since >= graceTicks {
+		img.raster.img.Deallocate()
 		img.raster = nil
 		img.restless = false
 	}
 }
 
-// makeRaster ensures that img.raster suits the display scale of p.
-func (img *Image) makeRaster(p placement) {
-	if img.raster != nil {
-		fx, fy := p.scaleX/img.anchorX, p.scaleY/img.anchorY
-		// Ebitengine chooses the mipmap level by the less shrunk axis, so
-		// the axes must not drift apart either.
-		if reusable(fx) && reusable(fy) && max(fx, fy)/min(fx, fy) < 2 {
-			return
-		}
+// wantRaster starts making a raster that suits the display scale of p,
+// unless img has or is making one.
+func (img *Image) wantRaster(p placement) {
+	if img.raster != nil && suits(p, img.anchorX, img.anchorY) {
+		return
+	}
+	if j := img.job; j != nil && !j.exact && suits(p, j.anchorX, j.anchorY) {
+		return
 	}
 	w, h := p.scaleX*p.sw, p.scaleY*p.sh
 	// Clamping both axes by the same factor keeps mipmapping even.
 	s := min(2, (maxRasterSize-2*rasterMargin)/max(w, h))
 	rw, rh := rasterSide(w*s)+2*rasterMargin, rasterSide(h*s)+2*rasterMargin
-	img.anchorX, img.anchorY = p.scaleX, p.scaleY
-	if img.raster != nil {
-		if img.raster.Bounds().Size() == image.Pt(rw, rh) {
-			return
-		}
-		img.raster.Deallocate()
+	if img.raster != nil && img.raster.img.Bounds().Size() == image.Pt(rw, rh) {
+		img.anchorX, img.anchorY = p.scaleX, p.scaleY
+		return
 	}
 	sx, sy := float64(rw-2*rasterMargin)/p.sw, float64(rh-2*rasterMargin)/p.sh
-	img.raster = ebiten.NewImageFromImage(img.svg.rasterize(rw, rh, sx, sy, rasterMargin, rasterMargin))
+	img.request(&job{
+		args:    rasterArgs{rw, rh, sx, sy, rasterMargin, rasterMargin},
+		anchorX: p.scaleX,
+		anchorY: p.scaleY,
+	})
+}
+
+// suits reports whether a raster made at twice the display scale (ax, ay)
+// suits the display scale of p.
+func suits(p placement, ax, ay float64) bool {
+	fx, fy := p.scaleX/ax, p.scaleY/ay
+	// Ebitengine chooses the mipmap level by the less shrunk axis, so the
+	// axes must not drift apart either.
+	return reusable(fx) && reusable(fy) && max(fx, fy)/min(fx, fy) < 2
+}
+
+// request makes j img's job, unless img's job makes the same raster or
+// has started.
+func (img *Image) request(j *job) {
+	if old := img.job; old != nil {
+		if old.exact == j.exact && old.args == j.args || !old.cancel() {
+			return
+		}
+	}
+	j.done = make(chan struct{})
+	img.job = j
+	start(img.svg, j)
+}
+
+// collect installs the raster that img's job made, once it has finished.
+// An exact raster for an earlier target is kept only while img has no
+// other raster to fall back to.
+func (img *Image) collect() {
+	j := img.job
+	if j == nil || !j.finished() {
+		return
+	}
+	img.job = nil
+	if j.pix == nil || j.exact && j.args != img.target && img.raster != nil {
+		return
+	}
+	r := &raster{img: ebiten.NewImageFromImage(j.pix), args: j.args}
+	if j.exact {
+		if img.exact != nil {
+			img.exact.img.Deallocate()
+		}
+		img.exact = r
+		return
+	}
+	r.margin = rasterMargin
+	if img.raster != nil {
+		img.raster.img.Deallocate()
+	}
+	img.raster = r
+	img.anchorX, img.anchorY = j.anchorX, j.anchorY
+	if img.exact != nil && !img.exactNow() {
+		img.exact.img.Deallocate()
+		img.exact = nil
+	}
 }
 
 // reusable reports whether a raster made at twice one display scale suits
@@ -302,6 +418,56 @@ func rasterSide(v float64) int {
 // rasterEdge rounds v to the nearest pixel edge in [0, n].
 func rasterEdge(v float64, n int) int {
 	return int(min(max(math.Round(v), 0), float64(n)))
+}
+
+// A job makes a raster in the background.
+type job struct {
+	args             rasterArgs
+	exact            bool    // whether the raster is exact or at twice the display scale
+	anchorX, anchorY float64 // the display scale of a raster that is not exact
+
+	state atomic.Int32  // queued, running or cancelled
+	done  chan struct{} // closed once the job has finished
+	pix   *image.RGBA   // the raster, unless the job was cancelled
+}
+
+const (
+	queued = iota
+	running
+	cancelled
+)
+
+// workers limits the jobs that rasterize at once, leaving the game a CPU.
+var workers = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)-1))
+
+// start runs j in the background. Tests replace it to run jobs at once.
+var start = func(s *SVG, j *job) { go j.run(s) }
+
+func (j *job) run(s *SVG) {
+	defer close(j.done)
+	workers <- struct{}{}
+	defer func() { <-workers }()
+	if j.state.CompareAndSwap(queued, running) {
+		a := j.args
+		j.pix = s.rasterize(a.w, a.h, a.sx, a.sy, a.dx, a.dy)
+	}
+}
+
+// cancel cancels j unless it has started, reporting whether j makes no
+// raster.
+func (j *job) cancel() bool {
+	j.state.CompareAndSwap(queued, cancelled)
+	return j.state.Load() == cancelled
+}
+
+// finished reports whether j has finished.
+func (j *job) finished() bool {
+	select {
+	case <-j.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // placement is a Draw resolved into the box's coordinates.
@@ -361,7 +527,7 @@ func finite(vs ...float64) bool {
 // exact returns the raster that p maps onto pixel for pixel, and the dst
 // position to draw it at. There is none if p's transform is not
 // axis-aligned with positive scale, or if the raster would be too large.
-func (p placement) exact() (t exactTarget, px, py float64, ok bool) {
+func (p placement) exact() (t rasterArgs, px, py float64, ok bool) {
 	a, b := p.geoM.Element(0, 0), p.geoM.Element(0, 1)
 	c, d := p.geoM.Element(1, 0), p.geoM.Element(1, 1)
 	if b != 0 || c != 0 || a <= 0 || d <= 0 {
@@ -376,7 +542,7 @@ func (p placement) exact() (t exactTarget, px, py float64, ok bool) {
 	if !(w >= 1 && w <= maxRasterSize && h >= 1 && h <= maxRasterSize) {
 		return t, 0, 0, false
 	}
-	return exactTarget{int(w), int(h), dw / p.sw, dh / p.sh, dx, dy}, px, py, true
+	return rasterArgs{int(w), int(h), dw / p.sw, dh / p.sh, dx, dy}, px, py, true
 }
 
 // exactSpan returns, along one axis, the first pixel and the number of

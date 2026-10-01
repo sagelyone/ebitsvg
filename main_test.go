@@ -25,7 +25,11 @@ func (g *testGame) Layout(int, int) (int, int) { return 1, 1 }
 
 // TestMain runs the tests in a game, so they need a display. To run them
 // headless, use xvfb-run -a go test ./...
+//
+// The tests run jobs at once, so that each Draw draws the raster it needs;
+// see inBackground.
 func TestMain(m *testing.M) {
+	start = runAtOnce
 	g := &testGame{m: m}
 	if err := ebiten.RunGame(g); err != nil {
 		panic(err)

@@ -79,10 +79,10 @@ func held(img *Image) string {
 }
 
 // rasters records the distinct rasters an Image has held.
-type rasters map[*ebiten.Image]bool
+type rasters map[*raster]bool
 
 func (r rasters) add(img *Image) {
-	for _, i := range []*ebiten.Image{img.exact, img.raster} {
+	for _, i := range []*raster{img.exact, img.raster} {
 		if i != nil {
 			r[i] = true
 		}
@@ -188,7 +188,7 @@ func TestRasterSize(t *testing.T) {
 				t.Fatalf("held %s; want 2x", got)
 			}
 			want := tt.want.Add(image.Pt(2*rasterMargin, 2*rasterMargin))
-			if got := img.raster.Bounds().Size(); got != want {
+			if got := img.raster.img.Bounds().Size(); got != want {
 				t.Errorf("raster size = %v; want %v", got, want)
 			}
 		})
@@ -338,7 +338,7 @@ func TestSettle(t *testing.T) {
 		*now++
 	}
 	draw(img, dst, 1, 13.5, 4, 40, 40, nil)
-	if want := (exactTarget{41, 40, 4, 4, 0.5, 0}); img.exact == nil || img.target != want {
+	if want := (rasterArgs{41, 40, 4, 4, 0.5, 0}); img.exact == nil || img.target != want {
 		t.Errorf("target = %+v; want %+v", img.target, want)
 	}
 	if got := held(img); got != "exact+2x" {
@@ -513,6 +513,95 @@ func TestDrawDisposedDst(t *testing.T) {
 			newImage(mustParse(t, halves), moving, 0, 0, 16, 16, opts).Draw(dst, 0, 0, 16, 16, opts)
 		})
 	}
+}
+
+func runAtOnce(s *SVG, j *job) { j.run(s) }
+
+// background holds the jobs that Images start, for the test to run.
+type background struct {
+	svg  *SVG
+	jobs []*job
+}
+
+// inBackground queues the jobs that Images start, for the rest of t,
+// instead of running them at once.
+func inBackground(t *testing.T) *background {
+	b := &background{}
+	start = func(s *SVG, j *job) { b.svg, b.jobs = s, append(b.jobs, j) }
+	t.Cleanup(func() { start = runAtOnce })
+	return b
+}
+
+// run runs the queued jobs.
+func (b *background) run() {
+	for _, j := range b.jobs {
+		j.run(b.svg)
+	}
+	b.jobs = nil
+}
+
+func TestDrawInBackground(t *testing.T) {
+	fakeTicks(t)
+	bg := inBackground(t)
+	s := mustParse(t, disc)
+	dst := ebiten.NewImage(64, 64)
+	img := NewImage(s)
+	fill := color.RGBA{0, 0x88, 0xff, 0xff}
+
+	draw(img, dst, 2, 3, 5, 40, 40, nil)
+	if got := held(img); got != "none" || len(bg.jobs) != 1 {
+		t.Fatalf("new: held %s, %d jobs; want none, 1", got, len(bg.jobs))
+	}
+	checkProbes(t, dst, []probe{{23, 25, empty}})
+	bg.run()
+	draw(img, dst, 1, 3, 5, 40, 40, nil)
+	checkExact(t, dst, s, 3, 5, 40, 40)
+
+	// While a raster for the new size is made, the exact raster for the
+	// old size is drawn scaled.
+	draw(img, dst, 1, 3, 5, 50, 50, nil)
+	if got := held(img); got != "exact" || len(bg.jobs) != 1 {
+		t.Fatalf("resized: held %s, %d jobs; want exact, 1", got, len(bg.jobs))
+	}
+	checkProbes(t, dst, []probe{{28, 30, fill}, {44, 30, fill}})
+
+	// A queued job that is no longer needed is cancelled.
+	draw(img, dst, 1, 3, 5, 200, 200, nil)
+	if len(bg.jobs) != 2 || bg.jobs[0].state.Load() != cancelled {
+		t.Fatal("unneeded queued job not cancelled for a new one")
+	}
+
+	// A started job is not replaced, and its raster is used once made.
+	bg.jobs[1].state.Store(running)
+	draw(img, dst, 1, 3, 5, 20, 20, nil)
+	if len(bg.jobs) != 2 {
+		t.Fatal("started job replaced")
+	}
+	bg.jobs[1].state.Store(queued)
+	bg.run()
+	draw(img, dst, 1, 3, 5, 20, 20, nil)
+	if got := held(img); got != "2x" || len(bg.jobs) != 1 {
+		t.Errorf("after the started job: held %s, %d jobs; want 2x, 1", got, len(bg.jobs))
+	}
+	checkProbes(t, dst, []probe{{13, 15, fill}})
+}
+
+// TestPrepareInBackground checks that Prepare waits for a job that Draw
+// started, and then makes the raster it was asked for.
+func TestPrepareInBackground(t *testing.T) {
+	fakeTicks(t)
+	s := mustParse(t, disc)
+	dst := ebiten.NewImage(64, 64)
+	start = func(s *SVG, j *job) { go j.run(s) }
+	t.Cleanup(func() { start = runAtOnce })
+	img := NewImage(s)
+	img.Draw(dst, 3, 5, 20, 20, nil)
+	img.Prepare(3, 5, 40, 40, nil)
+	if !img.exactNow() || img.job != nil {
+		t.Fatalf("held %s, job %v; want the exact raster, no job", held(img), img.job)
+	}
+	img.Draw(dst, 3, 5, 40, 40, nil)
+	checkExact(t, dst, s, 3, 5, 40, 40)
 }
 
 func TestPanics(t *testing.T) {

@@ -101,9 +101,9 @@ go run github.com/sagelyone/ebitsvg/examples/resize@latest
   zoomed size.
 - `ColorScale`, `Blend`: passed to `DrawImage`.
 
-`Prepare` takes `Draw`'s arguments except `dst` and rasterizes now what
-`Draw` settles on, so that drawing with them later does not rasterize. Use it
-to render ahead of time, such as behind a loading screen.
+`Prepare` takes `Draw`'s arguments except `dst` and rasterizes now, waiting
+for it, what `Draw` settles on, so that drawing with them later shows it at
+once. Use it to render ahead of time, such as behind a loading screen.
 
 `SVG.Rasterize(w, h)` renders to an `*image.RGBA` on the CPU, for a window
 icon or any other one-off image. It stretches the SVG to w×h; `SVG.Size`
@@ -189,6 +189,15 @@ ticks, and if they change within that time, it waits those 60 ticks before
 making another exact raster. Content that moves in steps therefore reuses its
 rasters, and a still `Image` ends up holding one. Moving by whole pixels keeps
 the exact raster. A rotated or flipped `GeoM` stays on the 2× raster.
+
+`Draw` never rasterizes, so it never makes a frame wait. An `Image` makes
+the raster it needs on another goroutine, one at a time, and meanwhile draws
+the closest raster it has, scaled, so that a resized SVG is briefly soft
+rather than late. A new `Image` draws nothing until its first raster is
+ready, a frame or so later; to show it at once, `Prepare` it ahead of time.
+Rasterizing uses at most one fewer CPU than `GOMAXPROCS`, leaving one for
+the game. In browsers, Go runs every goroutine on one thread, so a large
+raster can still delay frames while it is made.
 
 An `Image` caches for one target, so use one `Image` for each independently
 drawn use of an SVG. A parsed `SVG` is immutable and safe to share, even

@@ -2,10 +2,11 @@
 // are displayed, without rasterizing them every frame.
 //
 // Parse each SVG file once into an [SVG], which is immutable and can be
-// shared. An [Image] draws an SVG through cached rasters. While the displayed
-// size or position changes, it draws a raster made at twice the displayed
-// size, reused until that size halves or doubles. Once they settle, it draws a
-// raster made for exactly the pixels it covers.
+// shared. An [Image] draws an SVG through cached rasters, which it makes in
+// the background. While the displayed size or position changes, it draws a
+// raster made at twice the displayed size, reused until that size halves or
+// doubles. Once they settle, it draws a raster made for exactly the pixels it
+// covers.
 //
 // [SVG.Sprite] takes the sprites out of a sprite sheet, as SVGs of their own.
 package ebitsvg
