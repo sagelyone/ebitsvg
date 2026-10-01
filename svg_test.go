@@ -379,6 +379,104 @@ func TestRasterizeFailure(t *testing.T) {
 	}
 }
 
+// sheet returns a 60×40 sprite sheet with the given content between blue
+// rectangles that cover the canvas, which sprites must not draw.
+func sheet(viewBox, content string) string {
+	const cover = `<rect x="-100" y="-100" width="300" height="300" fill="#00f"/>`
+	return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="` + viewBox + `">` +
+		cover + content + `<g id="other">` + cover + `</g></svg>`
+}
+
+// TestSprite checks that a sprite draws like an SVG of just its group,
+// with the viewBox set to its bounds.
+func TestSprite(t *testing.T) {
+	const art = `<circle cx="20" cy="20" r="6" fill="#f00"/><rect x="12" y="12" width="4" height="4" fill="#0f0"/>`
+	tests := []struct {
+		name, src, want string
+	}{
+		{"padding",
+			sheet("0 0 60 40", `<g id="s"><rect x="10" y="10" width="20" height="20" fill="none"/>`+art+`</g>`),
+			`<svg viewBox="10 10 20 20">` + art + `</svg>`},
+		{"viewBox origin",
+			sheet("5 5 60 40", `<g id="s"><rect x="10" y="10" width="20" height="20" fill="none"/>`+art+`</g>`),
+			`<svg viewBox="10 10 20 20">` + art + `</svg>`},
+		{"bounds in style",
+			sheet("0 0 60 40", `<g id="s"><rect x="10" y="10" width="20" height="20" style="fill:none;stroke:none"/>`+art+`</g>`),
+			`<svg viewBox="10 10 20 20">` + art + `</svg>`},
+		{"bounds in style sheet",
+			sheet("0 0 60 40", `<style>.bounds { fill: none }</style><g id="s"><rect class="bounds" x="10" y="10" width="20" height="20"/>`+art+`</g>`),
+			`<svg viewBox="10 10 20 20">` + art + `</svg>`},
+		{"bounds after art",
+			sheet("0 0 60 40", `<g id="s">`+art+`<g><path d="M0 8H40" fill="none"/><rect x="8" y="8" width="24" height="16" fill="none"/></g></g>`),
+			`<svg viewBox="8 8 24 16">` + art + `</svg>`},
+		{"transformed bounds",
+			sheet("0 0 60 40", `<g id="s"><rect width="20" height="20" fill="none" transform="translate(10 10)"/>`+art+`</g>`),
+			`<svg viewBox="10 10 20 20">` + art + `</svg>`},
+		{"transformed group",
+			sheet("0 0 60 40", `<g transform="translate(30 0)"><g id="s" transform="scale(0.5)" opacity="0.5">
+				<rect x="10" y="10" width="20" height="20" fill="none"/>`+art+`</g></g>`),
+			`<svg viewBox="35 5 10 10"><g transform="translate(30 0) scale(0.5)" opacity="0.5">` + art + `</g></svg>`},
+		{"use",
+			sheet("0 0 60 40", `<defs><g id="frame"><rect x="10" y="10" width="20" height="20" fill="none"/>`+art+`</g></defs>
+				<use id="s" href="#frame" x="20"/>`),
+			`<svg viewBox="30 10 20 20"><g transform="translate(20 0)">` + art + `</g></svg>`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := mustParse(t, tt.src).Sprite("s")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := mustParse(t, tt.want)
+			gw, gh := got.Size()
+			if ww, wh := want.Size(); gw != ww || gh != wh {
+				t.Errorf("Size() = %v, %v; want %v, %v", gw, gh, ww, wh)
+			}
+			w, h := int(gw*4), int(gh*4)
+			if !slices.Equal(got.Rasterize(w, h).Pix, want.Rasterize(w, h).Pix) {
+				t.Error("pixels differ from those of an SVG of the group")
+			}
+		})
+	}
+}
+
+// TestSpriteOfSprite checks that a sprite finds the other sprites in its
+// document.
+func TestSpriteOfSprite(t *testing.T) {
+	s := mustParse(t, sheet("0 0 60 40", `<g id="a"><rect width="10" height="10" fill="none"/></g>
+		<g id="b"><rect x="10" width="20" height="30" fill="none"/></g>`))
+	a, err := s.Sprite("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := a.Sprite("b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w, h := b.Size(); w != 20 || h != 30 {
+		t.Errorf("Size() = %v, %v; want 20, 30", w, h)
+	}
+}
+
+func TestSpriteErrors(t *testing.T) {
+	tests := []struct{ content, id, want string }{
+		{`<g id="s"><rect width="10" height="10" fill="none"/></g>`, "t", `no group with id "t"`},
+		{`<g id="s"><rect width="10" height="10" fill="none"/></g>`, "", `no group with id ""`},
+		{`<g><rect width="10" height="10" fill="none"/></g>`, "", `no group with id ""`},
+		{`<rect id="s" width="10" height="10" fill="none"/>`, "s", `no group with id "s"`},
+		{`<defs><g id="s"><rect width="10" height="10" fill="none"/></g></defs>`, "s", `no group with id "s"`},
+		{`<g id="s"><rect width="10" height="10" fill="#f00"/></g>`, "s", `group "s" has no bounds`},
+		{`<g id="s"><rect width="10" height="10" fill="#f00" visibility="hidden"/></g>`, "s", `group "s" has no bounds`},
+		{`<g id="s"><path d="M0 0H10" fill="none"/></g>`, "s", `group "s" has no bounds`},
+	}
+	for _, tt := range tests {
+		_, err := mustParse(t, sheet("0 0 60 40", tt.content)).Sprite(tt.id)
+		if err == nil || !strings.HasPrefix(err.Error(), "ebitsvg: ") || !strings.Contains(err.Error(), tt.want) {
+			t.Errorf("Sprite(%q) in %.40q error = %v; want one containing %q", tt.id, tt.content, err, tt.want)
+		}
+	}
+}
+
 // line is a 20×20 SVG with a horizontal line through its middle.
 func line(attrs string) string {
 	return `<svg viewBox="0 0 20 20"><line x1="0" y1="10" x2="20" y2="10" stroke="#000" ` + attrs + `/></svg>`

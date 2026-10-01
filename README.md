@@ -117,6 +117,58 @@ An SVG is sharp up to 4096 pixels on a side. Displayed larger, it is
 magnified from a 4096-pixel raster and slightly soft, and a `Cover` fit's
 clip edge can be off by up to half a raster pixel, about 1 px at 8192 px.
 
+## Sprite sheets
+
+A sprite sheet is one SVG with each sprite in a group with an id. A
+rectangle in the group without fill or stroke sets the sprite's bounds: its
+size, and the padding around its art.
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 64">
+  <g id="walk-0">
+    <rect width="64" height="64" fill="none"/>
+    <!-- art -->
+  </g>
+  <g id="walk-1">
+    <rect x="64" width="64" height="64" fill="none"/>
+    <!-- art -->
+  </g>
+</svg>
+```
+
+`SVG.Sprite(id)` returns a sprite as an `SVG` of its own, sized to its
+bounds and drawn without the rest of the sheet, so that an `Image` draws it
+like any other SVG:
+
+```go
+sheet, err := ebitsvg.Parse(bytes.NewReader(sheetSVG))
+if err != nil {
+	log.Fatal(err)
+}
+walk := make([]*ebitsvg.Image, 2)
+for i := range walk {
+	s, err := sheet.Sprite(fmt.Sprintf("walk-%d", i))
+	if err != nil {
+		log.Fatal(err)
+	}
+	walk[i] = ebitsvg.NewImage(s)
+}
+```
+
+Then draw the current frame from your game's `Draw` method, such as with
+`walk[g.frame].Draw(screen, x, y, 64, 64, nil)`.
+
+The bounds rectangle draws nothing, so the sheet still draws as a whole,
+with each sprite in place. The first shape in the group, in document order,
+with neither fill nor stroke sets the bounds, whether that is set by
+attributes, `style` or a style sheet. A `<use>` element with an id is a
+sprite too, which lets frames share art. The group's transform, opacity and
+effects apply, as do its ancestors' transforms, such as an Inkscape layer's,
+but not their opacity, clipping, masks or filters.
+
+In Inkscape, set a group's id in Object Properties. Illustrator and Figma
+export layer names as ids when their export settings ask them to.
+
 ## How it works
 
 An `Image` first draws a raster made for exactly the pixels it covers, 1:1.

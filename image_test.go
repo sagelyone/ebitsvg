@@ -137,6 +137,26 @@ func TestDraw(t *testing.T) {
 	}
 }
 
+// TestDrawSprite checks that an Image draws a sprite and its padding
+// without the rest of its sheet.
+func TestDrawSprite(t *testing.T) {
+	s, err := mustParse(t, sheet("0 0 60 40", `<g id="s">
+		<rect x="10" y="10" width="20" height="20" fill="none"/>
+		<rect x="15" y="15" width="10" height="10" fill="#f00"/>
+	</g>`)).Sprite("s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := ebiten.NewImage(64, 64)
+	for _, moving := range []bool{false, true} {
+		t.Run(fmt.Sprintf("moving=%v", moving), func(t *testing.T) {
+			img := newImage(s, moving, 10, 10, 40, 40, nil)
+			draw(img, dst, 1, 10, 10, 40, 40, nil)
+			checkProbes(t, dst, []probe{{30, 30, red}, {21, 21, red}, {18, 30, empty}, {42, 30, empty}, {5, 5, empty}, {55, 55, empty}})
+		})
+	}
+}
+
 func TestRasterSize(t *testing.T) {
 	var zoom, squash, spin ebiten.GeoM
 	zoom.Scale(3, 3)

@@ -46,15 +46,32 @@ func (p *pool) parse(src []byte) (*Doc, error) {
 
 // Render renders the document into dst, a w×h image of premultiplied RGBA,
 // transformed by the matrix (sx 0 0 sy dx dy) from the document's user
-// space. On failure, dst is unchanged.
-func (d *Doc) Render(w, h int, sx, sy, dx, dy float32, dst []byte) error {
+// space. If id is not empty, it renders only the group with that id, as
+// transformed in the document, and nothing if there is none. On failure,
+// dst is unchanged.
+func (d *Doc) Render(id string, w, h int, sx, sy, dx, dy float32, dst []byte) error {
 	return d.p.run(func(in *instance) error {
 		tree, err := in.tree(d)
 		if err != nil {
 			return err
 		}
-		return in.renderTree(tree, w, h, sx, sy, dx, dy, dst)
+		return in.renderTree(tree, id, w, h, sx, sy, dx, dy, dst)
 	})
+}
+
+// Bounds returns the bounds (x, y, w, h) in the document's user space of
+// the group with the given id: the bounding box of the first shape in the
+// group, in document order, that has an area and neither fill nor stroke.
+func (d *Doc) Bounds(id string) (b [4]float32, err error) {
+	err = d.p.run(func(in *instance) error {
+		tree, err := in.tree(d)
+		if err != nil {
+			return err
+		}
+		b, err = in.bounds(tree, id)
+		return err
+	})
+	return b, err
 }
 
 // A treeCache holds an instance's trees, which only the call holding the
