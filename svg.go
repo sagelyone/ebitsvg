@@ -26,6 +26,8 @@ type SVG struct {
 	id   string     // of a sprite's group, or empty for the whole document
 	x, y float64    // the origin of a sprite's bounds in the document
 	w, h float64
+
+	cache cache // the rasters of its Images
 }
 
 // Parse reads an SVG document, which must be UTF-8 or ASCII. It renders
