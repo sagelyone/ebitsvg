@@ -101,9 +101,18 @@ go run github.com/sagelyone/ebitsvg/examples/resize@latest
   zoomed size.
 - `ColorScale`, `Blend`: passed to `DrawImage`.
 
-`Prepare` takes `Draw`'s arguments except `dst` and rasterizes now, waiting
-for it, what `Draw` settles on, so that drawing with them later shows it at
-once. Use it to render ahead of time, such as behind a loading screen.
+`Prepare` takes `Draw`'s arguments except `dst`, starts making what `Draw`
+settles on, and reports whether it is ready, so that drawing with them shows
+it at once. Like `Draw`, it never waits, so call it each frame until it
+reports true, such as while a loading screen is shown:
+
+```go
+ready := true
+for _, img := range images {
+	// Prepare comes first, so that every Image starts rasterizing.
+	ready = img.Prepare(x, y, 64, 64, nil) && ready
+}
+```
 
 `SVG.Rasterize(w, h)` renders to an `*image.RGBA` on the CPU, for a window
 icon or any other one-off image. It stretches the SVG to w×h; `SVG.Size`
@@ -194,7 +203,8 @@ the exact raster. A rotated or flipped `GeoM` stays on the 2× raster.
 the raster it needs on another goroutine, one at a time, and meanwhile draws
 the closest raster it has, scaled, so that a resized SVG is briefly soft
 rather than late. A new `Image` draws nothing until its first raster is
-ready, a frame or so later; to show it at once, `Prepare` it ahead of time.
+ready, a frame or so later; to show it at once, `Prepare` it until it is
+ready.
 Rasterizing uses at most one fewer CPU than `GOMAXPROCS`, leaving one for
 the game. In browsers, Go runs every goroutine on one thread, so a large
 raster can still delay frames while it is made.

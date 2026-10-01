@@ -415,7 +415,9 @@ func TestPrepare(t *testing.T) {
 
 	t.Run("exact", func(t *testing.T) {
 		img := NewImage(s)
-		img.Prepare(3, 5, 40, 40, nil)
+		if !img.Prepare(3, 5, 40, 40, nil) {
+			t.Fatal("Prepare = false; want true")
+		}
 		exact := img.exact
 		draw(img, dst, 1, 3, 5, 40, 40, nil)
 		if exact == nil || img.exact != exact || img.raster != nil {
@@ -426,7 +428,9 @@ func TestPrepare(t *testing.T) {
 
 	t.Run("rotated", func(t *testing.T) {
 		img := NewImage(s)
-		img.Prepare(3, 5, 40, 40, rotate)
+		if !img.Prepare(3, 5, 40, 40, rotate) {
+			t.Fatal("Prepare = false; want true")
+		}
 		raster := img.raster
 		draw(img, dst, 1, 3, 5, 40, 40, rotate)
 		if raster == nil || img.raster != raster {
@@ -493,7 +497,9 @@ func TestDrawNothing(t *testing.T) {
 			for range 2 {
 				img.Draw(dst, tt.x, tt.y, tt.w, tt.h, &DrawOptions{GeoM: tt.geoM})
 			}
-			img.Prepare(tt.x, tt.y, tt.w, tt.h, &DrawOptions{GeoM: tt.geoM})
+			if !img.Prepare(tt.x, tt.y, tt.w, tt.h, &DrawOptions{GeoM: tt.geoM}) {
+				t.Error("Prepare = false; want true")
+			}
 			if got := held(img); got != "none" {
 				t.Errorf("held %s; want none", got)
 			}
@@ -586,22 +592,58 @@ func TestDrawInBackground(t *testing.T) {
 	checkProbes(t, dst, []probe{{13, 15, fill}})
 }
 
-// TestPrepareInBackground checks that Prepare waits for a job that Draw
-// started, and then makes the raster it was asked for.
+// TestPrepareInBackground checks that Prepare reports false until the
+// raster it asked for is made, including while another job runs.
 func TestPrepareInBackground(t *testing.T) {
 	fakeTicks(t)
+	bg := inBackground(t)
 	s := mustParse(t, disc)
 	dst := ebiten.NewImage(64, 64)
-	start = func(s *SVG, j *job) { go j.run(s) }
-	t.Cleanup(func() { start = runAtOnce })
 	img := NewImage(s)
 	img.Draw(dst, 3, 5, 20, 20, nil)
-	img.Prepare(3, 5, 40, 40, nil)
-	if !img.exactNow() || img.job != nil {
-		t.Fatalf("held %s, job %v; want the exact raster, no job", held(img), img.job)
+	img.job.state.Store(running)
+	if img.Prepare(3, 5, 40, 40, nil) || len(bg.jobs) != 1 {
+		t.Fatalf("while another job runs: Prepare = true or %d jobs; want false, 1", len(bg.jobs))
+	}
+	img.job.state.Store(queued)
+	bg.run()
+	for range 2 {
+		if img.Prepare(3, 5, 40, 40, nil) {
+			t.Fatal("before its job runs: Prepare = true; want false")
+		}
+	}
+	if len(bg.jobs) != 1 {
+		t.Fatalf("%d jobs; want 1", len(bg.jobs))
+	}
+	bg.run()
+	if !img.Prepare(3, 5, 40, 40, nil) {
+		t.Fatal("after its job: Prepare = false; want true")
 	}
 	img.Draw(dst, 3, 5, 40, 40, nil)
 	checkExact(t, dst, s, 3, 5, 40, 40)
+}
+
+// TestPrepareConcurrently prepares Images that rasterize on other
+// goroutines, for the race detector.
+func TestPrepareConcurrently(t *testing.T) {
+	fakeTicks(t)
+	start = func(s *SVG, j *job) { go j.run(s) }
+	t.Cleanup(func() { start = runAtOnce })
+	s := mustParse(t, disc)
+	dst := ebiten.NewImage(64, 64)
+	imgs := make([]*Image, 8)
+	for i := range imgs {
+		imgs[i] = NewImage(s)
+	}
+	for _, img := range imgs {
+		for !img.Prepare(3, 5, 40, 40, nil) {
+			<-img.job.done
+		}
+	}
+	for _, img := range imgs {
+		draw(img, dst, 1, 3, 5, 40, 40, nil)
+		checkExact(t, dst, s, 3, 5, 40, 40)
+	}
 }
 
 func TestPanics(t *testing.T) {

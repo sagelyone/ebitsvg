@@ -167,32 +167,7 @@ func (img *Image) Draw(dst *ebiten.Image, x, y, w, h float64, opts *DrawOptions)
 	if !ok {
 		return
 	}
-	img.collect()
-	t, px, py, exact := p.exact()
-	var now int64
-	if exact {
-		now = tick()
-		if t != img.target {
-			img.setTarget(t, now)
-		}
-		wait := int64(settleTicks)
-		if img.restless {
-			wait = graceTicks
-		}
-		if img.exact == nil && img.raster == nil || img.exactNow() || now-img.since >= wait {
-			img.settle()
-		} else {
-			img.wantRaster(p)
-		}
-	} else {
-		img.setTarget(rasterArgs{}, 0)
-		img.wantRaster(p)
-	}
-	img.collect() // in case start ran the job at once, as tests make it
-	if exact {
-		img.retire(now)
-	}
-
+	px, py, exact := img.update(p, false)
 	op := &ebiten.DrawImageOptions{
 		ColorScale: opts.ColorScale,
 		Blend:      opts.Blend,
@@ -251,39 +226,60 @@ func keepsDst(b ebiten.Blend) bool {
 		keeps(b.BlendFactorDestinationAlpha, b.BlendOperationAlpha)
 }
 
-// Prepare rasterizes now what [Image.Draw] settles on for the same
-// arguments, so that drawing them needs no rasterization and draws them at
-// once. Use it to render ahead of time, such as behind a loading screen.
-func (img *Image) Prepare(x, y, w, h float64, opts *DrawOptions) {
+// Prepare starts making what [Image.Draw] settles on for the same
+// arguments, unless it is ready, and reports whether it is ready, so that
+// drawing with them shows it at once. Like Draw, it never waits for
+// rasterizing: call it each frame until it reports true, such as while a
+// loading screen is shown. A box that Draw draws nothing into is ready.
+func (img *Image) Prepare(x, y, w, h float64, opts *DrawOptions) bool {
 	if opts == nil {
 		opts = &DrawOptions{}
 	}
 	p, ok := img.place(x, y, w, h, opts)
 	if !ok {
-		return
+		return true
 	}
-	t, _, _, exact := p.exact()
-	now := tick()
-	for {
-		if exact {
-			if t != img.target {
-				img.setTarget(t, now)
-			}
+	if _, _, exact := img.update(p, true); exact {
+		return img.exactNow()
+	}
+	return img.raster != nil && suits(p, img.anchorX, img.anchorY)
+}
+
+// update collects a finished job and starts making the raster that p
+// needs: the exact one if p has an exact target that has settled, or that
+// prepare asks for at once, and otherwise one at twice the display scale.
+// It returns where an exact raster is drawn, if p has an exact target.
+func (img *Image) update(p placement, prepare bool) (px, py float64, exact bool) {
+	img.collect()
+	t, px, py, exact := p.exact()
+	var now int64
+	if exact {
+		now = tick()
+		if t != img.target {
+			img.setTarget(t, now)
+		}
+		wait := int64(settleTicks)
+		if img.restless {
+			wait = graceTicks
+		}
+		if prepare || img.exact == nil && img.raster == nil || img.exactNow() || now-img.since >= wait {
 			img.settle()
 		} else {
 			img.wantRaster(p)
 		}
-		// The job may have been making another raster.
-		j := img.job
-		if j == nil {
-			break
+	} else {
+		// Preparing a rotated or flipped draw leaves the target as Draw
+		// last had it.
+		if !prepare {
+			img.setTarget(rasterArgs{}, 0)
 		}
-		<-j.done
-		img.collect()
+		img.wantRaster(p)
 	}
+	img.collect() // in case start ran the job at once, as tests make it
 	if exact {
 		img.retire(now)
 	}
+	return px, py, exact
 }
 
 // exactNow reports whether img.exact is made for img.target.
