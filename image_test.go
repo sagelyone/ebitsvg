@@ -57,6 +57,14 @@ func newImage(s *SVG, moving bool, x, y, w, h float64, opts *DrawOptions) *Image
 	return img
 }
 
+// upload finishes uploading the raster that img's job made, which takes
+// Draw several frames for a large raster.
+func upload(img *Image) {
+	for img.job != nil {
+		img.collect()
+	}
+}
+
 // fakeTicks makes tick return the value it points to for the rest of t.
 func fakeTicks(t *testing.T) *int64 {
 	var now int64
@@ -184,6 +192,7 @@ func TestRasterSize(t *testing.T) {
 			opts := &DrawOptions{Fit: Stretch, GeoM: tt.geoM}
 			img := newImage(s, true, 0, 0, tt.w, tt.h, opts)
 			img.Draw(dst, 0, 0, tt.w, tt.h, opts)
+			upload(img)
 			if got := held(img); got != "2x" {
 				t.Fatalf("held %s; want 2x", got)
 			}
@@ -219,6 +228,40 @@ func TestNoFadedEdges(t *testing.T) {
 				edge(size.X-1, y)
 			}
 		})
+	}
+}
+
+// TestUploadInChunks checks that Draw uploads a large raster over several
+// frames, and installs it once it is whole.
+func TestUploadInChunks(t *testing.T) {
+	s := mustParse(t, halves)
+	dst := ebiten.NewImage(16, 16)
+	opts := &DrawOptions{Fit: Stretch}
+	img := NewImage(s)
+	draws := 0
+	for {
+		img.Draw(dst, 0, 0, 1e4, 5e3, opts)
+		draws++
+		if img.job == nil {
+			break
+		}
+		if img.raster != nil {
+			t.Fatal("raster installed before it was uploaded")
+		}
+	}
+	r := img.raster
+	w, h := r.args.w, r.args.h
+	if chunks := (h + uploadPixels/w - 1) / (uploadPixels / w); draws != chunks {
+		t.Errorf("uploaded in %d draws; want one for each of %d chunks", draws, chunks)
+	}
+	want := s.rasterize(w, h, r.args.sx, r.args.sy, r.args.dx, r.args.dy)
+	rows := uploadPixels / w
+	for _, y := range []int{0, rows - 1, rows, h / 2, h - 1} {
+		for _, x := range []int{w / 4, 3 * w / 4} {
+			if got, want := r.img.At(x, y).(color.RGBA), want.RGBAAt(x, y); got != want {
+				t.Errorf("pixel (%d, %d) = %v; want %v", x, y, got, want)
+			}
+		}
 	}
 }
 
@@ -268,6 +311,7 @@ func TestRasterReuse(t *testing.T) {
 	t.Run("beyond the size limit", func(t *testing.T) {
 		img := NewImage(s)
 		img.Draw(dst, 0, 0, 1e4, 5e3, opts)
+		upload(img)
 		first := img.raster
 		img.Draw(dst, 0, 0, 3e4, 1.5e4, opts)
 		if first == nil || img.raster != first {

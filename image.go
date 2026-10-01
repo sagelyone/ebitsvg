@@ -38,6 +38,11 @@ const (
 	// wide at every mipmap level a raster is drawn at.
 	rasterMargin = 4
 
+	// uploadPixels bounds the pixels of a raster that one Draw uploads to
+	// the GPU, which take about 0.25 ms, so that uploading a 4096×4096
+	// raster, which takes over 10 ms at once, spreads over 16 frames.
+	uploadPixels = 1 << 20
+
 	// subpixels is the precision, per pixel, of exact positions. Rounding to
 	// it lets content moved by whole pixels keep its exact raster despite
 	// floating-point error.
@@ -251,6 +256,7 @@ func (img *Image) Prepare(x, y, w, h float64, opts *DrawOptions) bool {
 // It returns where an exact raster is drawn, if p has an exact target.
 func (img *Image) update(p placement, prepare bool) (px, py float64, exact bool) {
 	img.collect()
+	j := img.job
 	t, px, py, exact := p.exact()
 	var now int64
 	if exact {
@@ -275,7 +281,9 @@ func (img *Image) update(p placement, prepare bool) (px, py float64, exact bool)
 		}
 		img.wantRaster(p)
 	}
-	img.collect() // in case start ran the job at once, as tests make it
+	if img.job != j {
+		img.collect() // in case start ran the new job at once, as tests make it
+	}
 	if exact {
 		img.retire(now)
 	}
@@ -364,19 +372,26 @@ func (img *Image) request(j *job) {
 	start(img.svg, j)
 }
 
-// collect installs the raster that img's job made, once it has finished.
-// An exact raster for an earlier target is kept only while img has no
-// other raster to fall back to.
+// collect uploads part of the raster that img's job made, once it has
+// finished, and installs it once uploaded. An exact raster for an earlier
+// target is kept only while img has no other raster to fall back to.
 func (img *Image) collect() {
 	j := img.job
 	if j == nil || !j.finished() {
 		return
 	}
-	img.job = nil
 	if j.pix == nil || j.exact && j.args != img.target && img.raster != nil {
+		if j.dst != nil {
+			j.dst.Deallocate()
+		}
+		img.job = nil
 		return
 	}
-	r := &raster{img: ebiten.NewImageFromImage(j.pix), args: j.args}
+	if !j.upload() {
+		return
+	}
+	img.job = nil
+	r := &raster{img: j.dst, args: j.args}
 	if j.exact {
 		if img.exact != nil {
 			img.exact.img.Deallocate()
@@ -425,6 +440,11 @@ type job struct {
 	state atomic.Int32  // queued, running or cancelled
 	done  chan struct{} // closed once the job has finished
 	pix   *image.RGBA   // the raster, unless the job was cancelled
+
+	// Once the job has finished, its Image uploads pix to dst, of which
+	// the rows above row are uploaded.
+	dst *ebiten.Image
+	row int
 }
 
 const (
@@ -454,6 +474,23 @@ func (j *job) run(s *SVG) {
 func (j *job) cancel() bool {
 	j.state.CompareAndSwap(queued, cancelled)
 	return j.state.Load() == cancelled
+}
+
+// upload uploads the next rows of j.pix to j.dst, up to uploadPixels,
+// reporting whether all are uploaded.
+func (j *job) upload() bool {
+	w, h := j.args.w, j.args.h
+	if j.dst == nil {
+		j.dst = ebiten.NewImage(w, h)
+	}
+	end := min(h, j.row+max(1, uploadPixels/w))
+	j.dst.SubImage(image.Rect(0, j.row, w, end)).(*ebiten.Image).WritePixels(j.pix.Pix[j.row*w*4 : end*w*4])
+	j.row = end
+	if j.row < h {
+		return false
+	}
+	j.pix = nil
+	return true
 }
 
 // finished reports whether j has finished.

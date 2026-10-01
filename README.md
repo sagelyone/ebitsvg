@@ -202,12 +202,16 @@ the exact raster. A rotated or flipped `GeoM` stays on the 2× raster.
 `Draw` never rasterizes, so it never makes a frame wait. An `Image` makes
 the raster it needs on another goroutine, one at a time, and meanwhile draws
 the closest raster it has, scaled, so that a resized SVG is briefly soft
-rather than late. A new `Image` draws nothing until its first raster is
-ready, a frame or so later; to show it at once, `Prepare` it until it is
-ready.
-Rasterizing uses at most one fewer CPU than `GOMAXPROCS`, leaving one for
-the game. In browsers, Go runs every goroutine on one thread, so a large
-raster can still delay frames while it is made.
+rather than late. Rasterizing uses at most one fewer CPU than `GOMAXPROCS`,
+leaving one for the game. `Draw` uploads a raster to the GPU in parts of
+about 0.25 ms each, over 16 frames for the largest. A new `Image` draws
+nothing until its first raster is ready, a few frames later; to show it at
+once, `Prepare` it until it is ready.
+
+In browsers, Go runs every goroutine on one thread, so rasterizing still
+delays frames, by as long as it takes: about 250 ms for a 3000-pixel raster
+of the resize example's emblem in Chrome. There, `Prepare` what you can
+while loading, and keep SVGs drawn during play small or simple.
 
 An `Image` caches for one target, so use one `Image` for each independently
 drawn use of an SVG. A parsed `SVG` is immutable and safe to share, even
