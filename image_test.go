@@ -5,7 +5,9 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"runtime"
 	"testing"
+	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 )
@@ -132,12 +134,11 @@ func TestDraw(t *testing.T) {
 		{"stretch", 10, 10, 40, 40, DrawOptions{Fit: Stretch},
 			[]probe{{15, 15, red}, {15, 45, red}, {45, 30, blue}, {30, 5, empty}, {55, 30, empty}}},
 	}
-	s := mustParse(t, halves)
 	dst := ebiten.NewImage(64, 64)
 	for _, tt := range tests {
 		for _, moving := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/moving=%v", tt.name, moving), func(t *testing.T) {
-				img := newImage(s, moving, tt.x, tt.y, tt.w, tt.h, &tt.opts)
+				img := newImage(mustParse(t, halves), moving, tt.x, tt.y, tt.w, tt.h, &tt.opts)
 				draw(img, dst, 1, tt.x, tt.y, tt.w, tt.h, &tt.opts)
 				checkProbes(t, dst, tt.probes)
 			})
@@ -148,16 +149,17 @@ func TestDraw(t *testing.T) {
 // TestDrawSprite checks that an Image draws a sprite and its padding
 // without the rest of its sheet.
 func TestDrawSprite(t *testing.T) {
-	s, err := mustParse(t, sheet("0 0 60 40", `<g id="s">
+	src := mustParse(t, sheet("0 0 60 40", `<g id="s">
 		<rect x="10" y="10" width="20" height="20" fill="none"/>
 		<rect x="15" y="15" width="10" height="10" fill="#f00"/>
-	</g>`)).Sprite("s")
-	if err != nil {
-		t.Fatal(err)
-	}
+	</g>`))
 	dst := ebiten.NewImage(64, 64)
 	for _, moving := range []bool{false, true} {
 		t.Run(fmt.Sprintf("moving=%v", moving), func(t *testing.T) {
+			s, err := src.Sprite("s")
+			if err != nil {
+				t.Fatal(err)
+			}
 			img := newImage(s, moving, 10, 10, 40, 40, nil)
 			draw(img, dst, 1, 10, 10, 40, 40, nil)
 			checkProbes(t, dst, []probe{{30, 30, red}, {21, 21, red}, {18, 30, empty}, {42, 30, empty}, {5, 5, empty}, {55, 55, empty}})
@@ -185,12 +187,11 @@ func TestRasterSize(t *testing.T) {
 		{"clamped", 1e5, 5e4, ebiten.GeoM{}, image.Pt(4088, 2044)},
 		{"clamped huge", 1e300, 1e300, ebiten.GeoM{}, image.Pt(4088, 4088)},
 	}
-	s := mustParse(t, halves)
 	dst := ebiten.NewImage(16, 16)
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := &DrawOptions{Fit: Stretch, GeoM: tt.geoM}
-			img := newImage(s, true, 0, 0, tt.w, tt.h, opts)
+			img := newImage(mustParse(t, halves), true, 0, 0, tt.w, tt.h, opts)
 			img.Draw(dst, 0, 0, tt.w, tt.h, opts)
 			upload(img)
 			if got := held(img); got != "2x" {
@@ -205,7 +206,6 @@ func TestRasterSize(t *testing.T) {
 }
 
 func TestNoFadedEdges(t *testing.T) {
-	s := mustParse(t, white)
 	dst := ebiten.NewImage(64, 64)
 	opts := &DrawOptions{Fit: Stretch}
 	for _, size := range []image.Point{{9, 3}, {21, 7}, {37, 13}} {
@@ -213,7 +213,7 @@ func TestNoFadedEdges(t *testing.T) {
 			// Anchoring at 1.5 times the size would make odd raster sides,
 			// which lose texels at the second mipmap level.
 			w, h := 1.5*float64(size.X), 1.5*float64(size.Y)
-			img := newImage(s, true, 0, 0, w, h, opts)
+			img := newImage(mustParse(t, white), true, 0, 0, w, h, opts)
 			draw(img, dst, 1, 0, 0, w, h, opts)
 			draw(img, dst, 1, 0, 0, float64(size.X), float64(size.Y), opts)
 			edge := func(x, y int) {
@@ -293,12 +293,11 @@ func TestRasterReuse(t *testing.T) {
 		{1, 0.5, false},
 		{0.5, 1.5, false},
 	}
-	s := mustParse(t, halves)
 	dst := ebiten.NewImage(16, 16)
 	opts := &DrawOptions{Fit: Stretch}
 	for _, tt := range tests {
 		t.Run(fmt.Sprintf("scale x(%v, %v)", tt.fx, tt.fy), func(t *testing.T) {
-			img := newImage(s, true, 0, 0, 20, 10, opts)
+			img := newImage(mustParse(t, halves), true, 0, 0, 20, 10, opts)
 			img.Draw(dst, 0, 0, 20, 10, opts)
 			first := img.raster
 			img.Draw(dst, 0, 0, 20*tt.fx, 10*tt.fy, opts)
@@ -309,7 +308,7 @@ func TestRasterReuse(t *testing.T) {
 	}
 
 	t.Run("beyond the size limit", func(t *testing.T) {
-		img := NewImage(s)
+		img := NewImage(mustParse(t, halves))
 		img.Draw(dst, 0, 0, 1e4, 5e3, opts)
 		upload(img)
 		first := img.raster
@@ -321,7 +320,6 @@ func TestRasterReuse(t *testing.T) {
 }
 
 func TestMovingEdges(t *testing.T) {
-	s := mustParse(t, white)
 	dst := ebiten.NewImage(32, 16)
 	opts := &DrawOptions{Fit: Stretch}
 	// Ebitengine snaps vertices to 0, 5/16 or 11/16 of a pixel, so the
@@ -330,7 +328,7 @@ func TestMovingEdges(t *testing.T) {
 	for _, c := range []float64{5.0 / 16, 11.0 / 16} {
 		t.Run(fmt.Sprintf("covering %v", c), func(t *testing.T) {
 			x := 5 - c
-			img := newImage(s, true, x, 2, 14, 6, opts)
+			img := newImage(mustParse(t, white), true, x, 2, 14, 6, opts)
 			draw(img, dst, 1, x, 2, 14, 6, opts)
 			a := uint8(255 * (2*c - 0.5))
 			want := color.RGBA{a, a, a, a}
@@ -401,11 +399,10 @@ func TestSettle(t *testing.T) {
 // settles on after the first step.
 func TestSteps(t *testing.T) {
 	now := fakeTicks(t)
-	s := mustParse(t, disc)
 	dst := ebiten.NewImage(64, 64)
 	for _, every := range []int{3, 4} {
 		t.Run(fmt.Sprintf("every %d ticks", every), func(t *testing.T) {
-			img := NewImage(s)
+			img := NewImage(mustParse(t, disc))
 			seen := rasters{}
 			var x float64
 			for i := range 8 {
@@ -453,11 +450,11 @@ func TestCameraScroll(t *testing.T) {
 
 func TestPrepare(t *testing.T) {
 	now := fakeTicks(t)
-	s := mustParse(t, disc)
 	dst := ebiten.NewImage(64, 64)
 	rotate := &DrawOptions{GeoM: rotated(64)}
 
 	t.Run("exact", func(t *testing.T) {
+		s := mustParse(t, disc)
 		img := NewImage(s)
 		if !img.Prepare(3, 5, 40, 40, nil) {
 			t.Fatal("Prepare = false; want true")
@@ -471,7 +468,7 @@ func TestPrepare(t *testing.T) {
 	})
 
 	t.Run("rotated", func(t *testing.T) {
-		img := NewImage(s)
+		img := NewImage(mustParse(t, disc))
 		if !img.Prepare(3, 5, 40, 40, rotate) {
 			t.Fatal("Prepare = false; want true")
 		}
@@ -483,7 +480,7 @@ func TestPrepare(t *testing.T) {
 	})
 
 	t.Run("rotated, then drawn exactly", func(t *testing.T) {
-		img := NewImage(s)
+		img := NewImage(mustParse(t, disc))
 		draw(img, dst, 1, 3, 5, 40, 40, nil)
 		img.Prepare(3, 5, 40, 40, rotate)
 		*now += graceTicks
@@ -495,13 +492,13 @@ func TestPrepare(t *testing.T) {
 }
 
 func TestDrawPassesOptions(t *testing.T) {
-	s := mustParse(t, white)
 	dst := ebiten.NewImage(16, 16)
 	half := &DrawOptions{Fit: Stretch}
 	half.ColorScale.ScaleAlpha(0.5)
 	erase := &DrawOptions{Fit: Stretch, Blend: ebiten.BlendClear}
 	for _, moving := range []bool{false, true} {
 		t.Run(fmt.Sprintf("moving=%v", moving), func(t *testing.T) {
+			s := mustParse(t, white)
 			draw(newImage(s, moving, 0, 0, 16, 16, half), dst, 1, 0, 0, 16, 16, half)
 			checkProbes(t, dst, []probe{{8, 8, color.RGBA{128, 128, 128, 128}}})
 
@@ -565,27 +562,28 @@ func TestDrawDisposedDst(t *testing.T) {
 	}
 }
 
-func runAtOnce(s *SVG, j *job) { j.run(s) }
+func runAtOnce(s *SVG, r *raster) { r.make(s) }
 
-// background holds the jobs that Images start, for the test to run.
+// background holds the rasters that Images start making, for the test to
+// make.
 type background struct {
 	svg  *SVG
-	jobs []*job
+	jobs []*raster
 }
 
-// inBackground queues the jobs that Images start, for the rest of t,
-// instead of running them at once.
+// inBackground queues the rasters that Images start making, for the rest
+// of t, instead of making them at once.
 func inBackground(t *testing.T) *background {
 	b := &background{}
-	start = func(s *SVG, j *job) { b.svg, b.jobs = s, append(b.jobs, j) }
+	start = func(s *SVG, r *raster) { b.svg, b.jobs = s, append(b.jobs, r) }
 	t.Cleanup(func() { start = runAtOnce })
 	return b
 }
 
-// run runs the queued jobs.
+// run makes the queued rasters.
 func (b *background) run() {
-	for _, j := range b.jobs {
-		j.run(b.svg)
+	for _, r := range b.jobs {
+		r.make(b.svg)
 	}
 	b.jobs = nil
 }
@@ -671,7 +669,7 @@ func TestPrepareInBackground(t *testing.T) {
 // goroutines, for the race detector.
 func TestPrepareConcurrently(t *testing.T) {
 	fakeTicks(t)
-	start = func(s *SVG, j *job) { go j.run(s) }
+	start = func(s *SVG, r *raster) { go r.make(s) }
 	t.Cleanup(func() { start = runAtOnce })
 	s := mustParse(t, disc)
 	dst := ebiten.NewImage(64, 64)
@@ -687,6 +685,87 @@ func TestPrepareConcurrently(t *testing.T) {
 	for _, img := range imgs {
 		draw(img, dst, 1, 3, 5, 40, 40, nil)
 		checkExact(t, dst, s, 3, 5, 40, 40)
+	}
+}
+
+// TestShare checks that the Images of an SVG share the rasters they all
+// need, and release them once none does.
+func TestShare(t *testing.T) {
+	now := fakeTicks(t)
+	made := 0
+	start = func(s *SVG, r *raster) { made++; r.make(s) }
+	t.Cleanup(func() { start = runAtOnce })
+	s := mustParse(t, disc)
+	dst := ebiten.NewImage(64, 64)
+	a, b := NewImage(s), NewImage(s)
+
+	draw(a, dst, 1, 3, 5, 40, 40, nil)
+	draw(b, dst, 1, 13, 4, 40, 40, nil)
+	if made != 1 || a.exact == nil || b.exact != a.exact || a.exact.refs != 2 {
+		t.Fatalf("made %d rasters, shared exact = %v; want 1, true", made, b.exact == a.exact)
+	}
+	checkExact(t, dst, s, 13, 4, 40, 40)
+
+	draw(a, dst, 1, 3.5, 5, 30, 30, nil)
+	draw(b, dst, 1, 13.5, 4, 30, 30, nil)
+	if made != 2 || a.raster == nil || b.raster != a.raster || a.raster.refs != 2 {
+		t.Fatalf("moving: made %d rasters, shared 2x = %v; want 2, true", made, b.raster == a.raster)
+	}
+
+	*now += graceTicks
+	r := a.raster
+	draw(a, dst, 1, 3.5, 5, 30, 30, nil)
+	if r.refs != 1 || len(s.cache.rasters) != 2 {
+		t.Errorf("one Image releases the 2x raster: %d refs, %d rasters; want 1, 2", r.refs, len(s.cache.rasters))
+	}
+	draw(b, dst, 1, 13.5, 4, 30, 30, nil)
+	if r.refs != 0 || len(s.cache.rasters) != 1 || b.exact != a.exact {
+		t.Errorf("both settle: %d refs to the 2x raster, %d rasters, shared exact = %v; want 0, 1, true",
+			r.refs, len(s.cache.rasters), b.exact == a.exact)
+	}
+	if made != 3 {
+		t.Errorf("made %d rasters; want 3", made)
+	}
+}
+
+// TestDrawShared checks that a new Image draws a raster that another Image
+// of the SVG has, at once.
+func TestDrawShared(t *testing.T) {
+	fakeTicks(t)
+	s := mustParse(t, disc)
+	dst := ebiten.NewImage(64, 64)
+	a := newImage(s, true, 3, 5, 40, 40, nil)
+	draw(a, dst, 1, 3, 5, 40, 40, nil)
+
+	bg := inBackground(t)
+	b := NewImage(s)
+	draw(b, dst, 1, 7, 5, 36, 36, nil)
+	if got := held(b); got != "2x" || b.raster != a.raster || len(bg.jobs) != 0 {
+		t.Fatalf("held %s, shared = %v, %d jobs; want 2x, true, 0", got, b.raster == a.raster, len(bg.jobs))
+	}
+	checkProbes(t, dst, []probe{{25, 23, color.RGBA{0, 0x88, 0xff, 0xff}}, {3, 3, empty}})
+}
+
+// TestForget checks that the rasters of a dropped Image, which were never
+// released, leave the cache once collected.
+func TestForget(t *testing.T) {
+	s := mustParse(t, disc)
+	func() {
+		draw(NewImage(s), ebiten.NewImage(64, 64), 1, 3, 5, 40, 40, nil)
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		runtime.GC()
+		s.cache.mu.Lock()
+		n := len(s.cache.rasters)
+		s.cache.mu.Unlock()
+		if n == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d rasters cached; want 0", n)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

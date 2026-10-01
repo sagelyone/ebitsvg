@@ -6,7 +6,9 @@ import (
 	"image"
 	"math"
 	"runtime"
+	"sync"
 	"sync/atomic"
+	"weak"
 
 	"github.com/hajimehoshi/ebiten/v2"
 )
@@ -97,17 +99,22 @@ type DrawOptions struct {
 // steps reuses its rasters and a still Image ends up holding one.
 //
 // Until the raster it needs is ready, an Image draws the closest one it
-// has, scaled, and a new Image draws nothing; [Image.Prepare] makes rasters
-// ahead of time. An Image makes one raster at a time, and Images make at
-// most GOMAXPROCS-1 at once, leaving the game a CPU.
+// has, scaled; [Image.Prepare] makes rasters ahead of time. An Image makes
+// one raster at a time, and Images make at most GOMAXPROCS-1 at once,
+// leaving the game a CPU.
+//
+// The Images of an SVG share the rasters they all need, such as those of
+// sprites moving at the same size, and a new Image draws a raster that
+// another has, if one suits it. Images share only through the same *SVG,
+// so take each sprite from its sheet once.
 //
 // An Image caches for one target, so use one Image for each independently
 // drawn use of an SVG. An Image is not safe for concurrent use.
 type Image struct {
 	svg *SVG
 
-	// raster was made at twice the display scale (anchorX, anchorY), with
-	// rasterMargin texels around the SVG.
+	// raster was made at twice a display scale that suits (anchorX,
+	// anchorY), with rasterMargin texels around the SVG.
 	raster           *raster
 	anchorX, anchorY float64
 
@@ -119,8 +126,9 @@ type Image struct {
 	since    int64
 	restless bool
 
-	// job, if not nil, makes a raster in the background.
-	job *job
+	// job, if not nil, is the raster img waits for, which is being made or
+	// uploaded.
+	job *raster
 }
 
 // tick is [ebiten.Tick], replaced by tests, which run within one tick.
@@ -134,11 +142,32 @@ type rasterArgs struct {
 }
 
 // A raster is an SVG rasterized with args, with margin transparent texels
-// around the SVG's bounds.
+// around the SVG's bounds. It is made in the background and then uploaded
+// to img in parts. Once it is ready, its fields do not change, except refs.
 type raster struct {
-	img    *ebiten.Image
-	args   rasterArgs
-	margin int
+	args             rasterArgs
+	margin           int     // rasterMargin, or 0 for an exact raster
+	anchorX, anchorY float64 // the display scale that a raster with a margin is made at twice
+
+	refs int // the Images that hold it, guarded by the cache's mu
+
+	state atomic.Int32  // queued, running or cancelled
+	done  chan struct{} // closed once made
+	pix   *image.RGBA   // the raster, made and not yet uploaded
+
+	// img is the uploaded raster, of which the rows above row are uploaded.
+	// They are guarded by the cache's mu.
+	img *ebiten.Image
+	row int
+}
+
+// A cache holds the rasters that the Images of an SVG hold or are making,
+// so that they share them.
+type cache struct {
+	mu sync.Mutex
+	// rasters is weak so that the rasters of Images that are dropped
+	// without releasing them are collected.
+	rasters map[rasterArgs]weak.Pointer[raster]
 }
 
 // NewImage returns an Image that draws svg. It panics if svg is nil.
@@ -256,6 +285,9 @@ func (img *Image) Prepare(x, y, w, h float64, opts *DrawOptions) bool {
 // It returns where an exact raster is drawn, if p has an exact target.
 func (img *Image) update(p placement, prepare bool) (px, py float64, exact bool) {
 	img.collect()
+	if img.raster == nil && img.exact == nil {
+		img.adopt(p)
+	}
 	j := img.job
 	t, px, py, exact := p.exact()
 	var now int64
@@ -282,7 +314,9 @@ func (img *Image) update(p placement, prepare bool) (px, py float64, exact bool)
 		img.wantRaster(p)
 	}
 	if img.job != j {
-		img.collect() // in case start ran the new job at once, as tests make it
+		// The new job may have finished: another Image made it, or a test
+		// ran it at once.
+		img.collect()
 	}
 	if exact {
 		img.retire(now)
@@ -301,8 +335,11 @@ func (img *Image) setTarget(t rasterArgs, since int64) {
 		if img.exactNow() {
 			img.restless = img.raster != nil
 		}
-		if j := img.job; j != nil && j.exact {
-			j.cancel()
+		if j := img.job; j != nil && j.exact() {
+			c := &img.svg.cache
+			c.mu.Lock()
+			img.dropJob()
+			c.mu.Unlock()
 		}
 	}
 	img.target, img.since = t, since
@@ -310,8 +347,14 @@ func (img *Image) setTarget(t rasterArgs, since int64) {
 
 // settle starts making the exact raster for img.target, unless img has it.
 func (img *Image) settle() {
-	if !img.exactNow() {
-		img.request(&job{args: img.target, exact: true})
+	if img.exactNow() || img.job != nil && img.job.args == img.target {
+		return
+	}
+	c := &img.svg.cache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if img.dropJob() {
+		img.job = c.hold(img.svg, img.target, 0, 0)
 	}
 }
 
@@ -319,35 +362,64 @@ func (img *Image) settle() {
 // raster and the target has persisted for graceTicks at tick now.
 func (img *Image) retire(now int64) {
 	if img.exactNow() && img.raster != nil && now-img.since >= graceTicks {
-		img.raster.img.Deallocate()
+		c := &img.svg.cache
+		c.mu.Lock()
+		c.release(img.raster)
+		c.mu.Unlock()
 		img.raster = nil
 		img.restless = false
 	}
 }
 
+// adopt makes a ready raster of the SVG that suits p img's raster, so that
+// a new Image draws one that another Image has at once.
+func (img *Image) adopt(p placement) {
+	c := &img.svg.cache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r := c.suiting(p); r != nil && r.ready() {
+		r.refs++
+		img.raster, img.anchorX, img.anchorY = r, r.anchorX, r.anchorY
+	}
+}
+
 // wantRaster starts making a raster that suits the display scale of p,
-// unless img has or is making one.
+// unless img has or is making one, or another Image has or is making one.
 func (img *Image) wantRaster(p placement) {
 	if img.raster != nil && suits(p, img.anchorX, img.anchorY) {
 		return
 	}
-	if j := img.job; j != nil && !j.exact && suits(p, j.anchorX, j.anchorY) {
+	a := twice(p.sw, p.sh, p.scaleX, p.scaleY)
+	if j := img.job; j != nil && (j.args == a || !j.exact() && suits(p, j.anchorX, j.anchorY)) {
 		return
 	}
-	w, h := p.scaleX*p.sw, p.scaleY*p.sh
-	// Clamping both axes by the same factor keeps mipmapping even.
-	s := min(2, (maxRasterSize-2*rasterMargin)/max(w, h))
-	rw, rh := rasterSide(w*s)+2*rasterMargin, rasterSide(h*s)+2*rasterMargin
-	if img.raster != nil && img.raster.img.Bounds().Size() == image.Pt(rw, rh) {
+	if img.raster != nil && img.raster.args.w == a.w && img.raster.args.h == a.h {
 		img.anchorX, img.anchorY = p.scaleX, p.scaleY
 		return
 	}
-	sx, sy := float64(rw-2*rasterMargin)/p.sw, float64(rh-2*rasterMargin)/p.sh
-	img.request(&job{
-		args:    rasterArgs{rw, rh, sx, sy, rasterMargin, rasterMargin},
-		anchorX: p.scaleX,
-		anchorY: p.scaleY,
-	})
+	c := &img.svg.cache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !img.dropJob() {
+		return
+	}
+	if r := c.suiting(p); r != nil {
+		r.refs++
+		img.job = r
+		return
+	}
+	img.job = c.hold(img.svg, a, p.scaleX, p.scaleY)
+}
+
+// twice returns the args of a raster of an sw×sh SVG made at twice the
+// display scale (scaleX, scaleY), with rasterMargin texels around it.
+func twice(sw, sh, scaleX, scaleY float64) rasterArgs {
+	w, h := scaleX*sw, scaleY*sh
+	// Clamping both axes by the same factor keeps mipmapping even.
+	s := min(2, (maxRasterSize-2*rasterMargin)/max(w, h))
+	rw, rh := rasterSide(w*s)+2*rasterMargin, rasterSide(h*s)+2*rasterMargin
+	sx, sy := float64(rw-2*rasterMargin)/sw, float64(rh-2*rasterMargin)/sh
+	return rasterArgs{rw, rh, sx, sy, rasterMargin, rasterMargin}
 }
 
 // suits reports whether a raster made at twice the display scale (ax, ay)
@@ -359,31 +431,34 @@ func suits(p placement, ax, ay float64) bool {
 	return reusable(fx) && reusable(fy) && max(fx, fy)/min(fx, fy) < 2
 }
 
-// request makes j img's job, unless img's job makes the same raster or
-// has started.
-func (img *Image) request(j *job) {
-	if old := img.job; old != nil {
-		if old.exact == j.exact && old.args == j.args || !old.cancel() {
-			return
-		}
+// dropJob releases img's job, unless img alone holds it and it has started,
+// and reports whether img has no job. The cache's mu must be held.
+func (img *Image) dropJob() bool {
+	j := img.job
+	if j == nil {
+		return true
 	}
-	j.done = make(chan struct{})
-	img.job = j
-	start(img.svg, j)
+	if j.refs == 1 && j.state.Load() != queued {
+		return false
+	}
+	img.svg.cache.release(j)
+	img.job = nil
+	return true
 }
 
-// collect uploads part of the raster that img's job made, once it has
-// finished, and installs it once uploaded. An exact raster for an earlier
-// target is kept only while img has no other raster to fall back to.
+// collect uploads part of img's job once it has been made, and installs it
+// once uploaded. An exact raster for an earlier target is kept only while
+// img has no other raster to fall back to.
 func (img *Image) collect() {
 	j := img.job
 	if j == nil || !j.finished() {
 		return
 	}
-	if j.pix == nil || j.exact && j.args != img.target && img.raster != nil {
-		if j.dst != nil {
-			j.dst.Deallocate()
-		}
+	c := &img.svg.cache
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if j.exact() && j.args != img.target && img.raster != nil {
+		c.release(j)
 		img.job = nil
 		return
 	}
@@ -391,22 +466,20 @@ func (img *Image) collect() {
 		return
 	}
 	img.job = nil
-	r := &raster{img: j.dst, args: j.args}
-	if j.exact {
+	if j.exact() {
 		if img.exact != nil {
-			img.exact.img.Deallocate()
+			c.release(img.exact)
 		}
-		img.exact = r
+		img.exact = j
 		return
 	}
-	r.margin = rasterMargin
 	if img.raster != nil {
-		img.raster.img.Deallocate()
+		c.release(img.raster)
 	}
-	img.raster = r
+	img.raster = j
 	img.anchorX, img.anchorY = j.anchorX, j.anchorY
 	if img.exact != nil && !img.exactNow() {
-		img.exact.img.Deallocate()
+		c.release(img.exact)
 		img.exact = nil
 	}
 }
@@ -431,20 +504,67 @@ func rasterEdge(v float64, n int) int {
 	return int(min(max(math.Round(v), 0), float64(n)))
 }
 
-// A job makes a raster in the background.
-type job struct {
-	args             rasterArgs
-	exact            bool    // whether the raster is exact or at twice the display scale
-	anchorX, anchorY float64 // the display scale of a raster that is not exact
+// hold returns a raster of s with args, made at twice the display scale
+// (ax, ay) or, if they are zero, exact, and holds it. It starts making the
+// raster unless an Image holds it. c.mu must be held.
+func (c *cache) hold(s *SVG, args rasterArgs, ax, ay float64) *raster {
+	r := c.rasters[args].Value()
+	if r == nil {
+		r = &raster{args: args, anchorX: ax, anchorY: ay, done: make(chan struct{})}
+		if ax != 0 {
+			r.margin = rasterMargin
+		}
+		if c.rasters == nil {
+			c.rasters = map[rasterArgs]weak.Pointer[raster]{}
+		}
+		w := weak.Make(r)
+		c.rasters[args] = w
+		runtime.AddCleanup(r, func(w weak.Pointer[raster]) {
+			c.mu.Lock()
+			defer c.mu.Unlock()
+			if c.rasters[args] == w {
+				delete(c.rasters, args)
+			}
+		}, w)
+		start(s, r)
+	}
+	r.refs++
+	return r
+}
 
-	state atomic.Int32  // queued, running or cancelled
-	done  chan struct{} // closed once the job has finished
-	pix   *image.RGBA   // the raster, unless the job was cancelled
+// release releases a hold on r. Once no Image holds r, it cancels making r
+// or deallocates it. c.mu must be held.
+func (c *cache) release(r *raster) {
+	r.refs--
+	if r.refs > 0 {
+		return
+	}
+	delete(c.rasters, r.args)
+	r.state.CompareAndSwap(queued, cancelled)
+	if r.img != nil {
+		r.img.Deallocate()
+	}
+}
 
-	// Once the job has finished, its Image uploads pix to dst, of which
-	// the rows above row are uploaded.
-	dst *ebiten.Image
-	row int
+// suiting returns the raster made at twice a display scale that best suits
+// p of those that Images hold, preferring ready ones and then those made
+// for the closest scale, or nil if none suits. c.mu must be held.
+func (c *cache) suiting(p placement) *raster {
+	var best *raster
+	var bestReady bool
+	var bestDist float64
+	for _, w := range c.rasters {
+		r := w.Value()
+		if r == nil || r.exact() || !suits(p, r.anchorX, r.anchorY) {
+			continue
+		}
+		ready := r.ready()
+		dist := math.Abs(math.Log(p.scaleX/r.anchorX)) + math.Abs(math.Log(p.scaleY/r.anchorY))
+		if best == nil || ready && !bestReady || ready == bestReady && dist < bestDist {
+			best, bestReady, bestDist = r, ready, dist
+		}
+	}
+	return best
 }
 
 const (
@@ -453,54 +573,64 @@ const (
 	cancelled
 )
 
-// workers limits the jobs that rasterize at once, leaving the game a CPU.
+// workers limits the rasters made at once, leaving the game a CPU.
 var workers = make(chan struct{}, max(1, runtime.GOMAXPROCS(0)-1))
 
-// start runs j in the background. Tests replace it to run jobs at once.
-var start = func(s *SVG, j *job) { go j.run(s) }
+// start makes r in the background. Tests replace it to make rasters at
+// once.
+var start = func(s *SVG, r *raster) { go r.make(s) }
 
-func (j *job) run(s *SVG) {
-	defer close(j.done)
+// make makes r, unless it is cancelled first.
+func (r *raster) make(s *SVG) {
+	defer close(r.done)
 	workers <- struct{}{}
 	defer func() { <-workers }()
-	if j.state.CompareAndSwap(queued, running) {
-		a := j.args
-		j.pix = s.rasterize(a.w, a.h, a.sx, a.sy, a.dx, a.dy)
+	if r.state.CompareAndSwap(queued, running) {
+		a := r.args
+		r.pix = s.rasterize(a.w, a.h, a.sx, a.sy, a.dx, a.dy)
 	}
 }
 
-// cancel cancels j unless it has started, reporting whether j makes no
-// raster.
-func (j *job) cancel() bool {
-	j.state.CompareAndSwap(queued, cancelled)
-	return j.state.Load() == cancelled
+// exact reports whether r was made for an exact target.
+func (r *raster) exact() bool {
+	return r.margin == 0
 }
 
-// upload uploads the next rows of j.pix to j.dst, up to uploadPixels,
-// reporting whether all are uploaded.
-func (j *job) upload() bool {
-	w, h := j.args.w, j.args.h
-	if j.dst == nil {
-		j.dst = ebiten.NewImage(w, h)
-	}
-	end := min(h, j.row+max(1, uploadPixels/w))
-	j.dst.SubImage(image.Rect(0, j.row, w, end)).(*ebiten.Image).WritePixels(j.pix.Pix[j.row*w*4 : end*w*4])
-	j.row = end
-	if j.row < h {
-		return false
-	}
-	j.pix = nil
-	return true
-}
-
-// finished reports whether j has finished.
-func (j *job) finished() bool {
+// finished reports whether r has been made or cancelled.
+func (r *raster) finished() bool {
 	select {
-	case <-j.done:
+	case <-r.done:
 		return true
 	default:
 		return false
 	}
+}
+
+// ready reports whether r has been made and uploaded. The cache's mu must
+// be held.
+func (r *raster) ready() bool {
+	return r.finished() && r.pix == nil && r.img != nil
+}
+
+// upload uploads the next rows of r.pix to r.img, up to uploadPixels, once
+// r has been made, reporting whether all are uploaded. The cache's mu must
+// be held.
+func (r *raster) upload() bool {
+	if r.pix == nil {
+		return r.img != nil
+	}
+	w, h := r.args.w, r.args.h
+	if r.img == nil {
+		r.img = ebiten.NewImage(w, h)
+	}
+	end := min(h, r.row+max(1, uploadPixels/w))
+	r.img.SubImage(image.Rect(0, r.row, w, end)).(*ebiten.Image).WritePixels(r.pix.Pix[r.row*w*4 : end*w*4])
+	r.row = end
+	if r.row < h {
+		return false
+	}
+	r.pix = nil
+	return true
 }
 
 // placement is a Draw resolved into the box's coordinates.

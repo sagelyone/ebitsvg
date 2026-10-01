@@ -204,9 +204,14 @@ the raster it needs on another goroutine, one at a time, and meanwhile draws
 the closest raster it has, scaled, so that a resized SVG is briefly soft
 rather than late. Rasterizing uses at most one fewer CPU than `GOMAXPROCS`,
 leaving one for the game. `Draw` uploads a raster to the GPU in parts of
-about 0.25 ms each, over 16 frames for the largest. A new `Image` draws
-nothing until its first raster is ready, a few frames later; to show it at
-once, `Prepare` it until it is ready.
+about 0.25 ms each, over 16 frames for the largest.
+
+The `Image`s of an `SVG` share the rasters they all need: sprites moving at
+the same size share one, as do still sprites at the same subpixel position,
+such as whole pixels. A new `Image` draws a raster that another has, if one
+suits it, and otherwise nothing until its own raster is ready, a few frames
+later. To show it at once, `Prepare` it until it is ready. Sharing goes
+through the same `*SVG`, so take each sprite from its sheet once.
 
 In browsers, Go runs every goroutine on one thread, so rasterizing still
 delays frames, by as long as it takes: about 250 ms for a 3000-pixel raster
